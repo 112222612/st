@@ -1,6 +1,9 @@
 /*!
- * 空回守卫 Empty Reply Guard v1.0.0
+ * 空回守卫 Empty Reply Guard v2.0.0
  * 自动检测并修复酒馆(SillyTavern)的“空回复”（仅供私人使用）。
+ * v2.0 新增“请求层修复”：包装 window.fetch，在生成请求到达酒馆解析器之前
+ * 就完成 空流自动重试 → 非流式兜底 → 格式修复 → 工具调用提示，
+ * 让酒馆“第一次就不空”（纯本地运行，不依赖任何服务器）。
  * License: MIT
  */
 (function (global) {
@@ -8,7 +11,7 @@
 
     const PLUGIN_KEY = 'emptyReplyGuard';
     const PLUGIN_NAME = '空回守卫 · Empty Reply Guard';
-    const VERSION = '1.0.0';
+    const VERSION = '2.0.0';
 
     // =========================================================
     // 默认设置（会合并进 extension_settings.emptyReplyGuard）
@@ -22,6 +25,9 @@
         treatPlaceholderAsEmpty: true, // 把 "..." 占位消息视为空回复
         handleTypes: 'normal, regenerate', // 处理哪些生成类型（逗号分隔）
         debug: false,                  // 控制台调试日志
+        enableFetchGuard: true,        // 请求层修复：拦截生成请求，第一次就不空
+        fetchMaxRetries: 2,            // 请求层空流自动重试次数（0-5）
+        fetchFallbackNonStream: true,  // 请求层重试仍空 → 用非流式兜底
     };
 
     // =========================================================
@@ -172,6 +178,266 @@
     }
 
     // =========================================================
+    // v2.0 请求层修复：包装 window.fetch，让酒馆“第一次就不空”
+    // =========================================================
+
+    function ergTryJson(s) {
+        try { return JSON.parse(s); } catch { return null; }
+    }
+
+    /** 按行解析 SSE（兼容标准 SSE 与 ndjson / 纯 JSON 行）。 */
+    async function* ergParseSSE(reader, decoder) {
+        let buffer = '';
+        let pendingLines = [];
+        const flushEvent = () => {
+            if (!pendingLines.length) return null;
+            const d = pendingLines.join('\n');
+            pendingLines = [];
+            return d;
+        };
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            let m;
+            while ((m = /\r?\n/.exec(buffer)) !== null) {
+                const line = buffer.slice(0, m.index).replace(/\r$/, '');
+                buffer = buffer.slice(m.index + m[0].length);
+                if (line === '') {
+                    const d = flushEvent();
+                    if (d) yield { data: d };
+                    continue;
+                }
+                if (line.startsWith('data:')) {
+                    pendingLines.push(line.slice(5).replace(/^ /, ''));
+                } else if (!line.startsWith(':') && !line.startsWith('event:') && !line.startsWith('id:') && !line.startsWith('retry:')) {
+                    if (ergTryJson(line)) {
+                        const d = flushEvent();
+                        if (d) yield { data: d };
+                        yield { data: line };
+                    } else if (typeof console !== 'undefined') {
+                        console.debug('[空回守卫] 忽略无法解析的行:', line.slice(0, 160));
+                    }
+                }
+            }
+        }
+        if (buffer.trim()) {
+            const line = buffer.replace(/\r$/, '');
+            if (line.startsWith('data:')) pendingLines.push(line.slice(5).replace(/^ /, ''));
+            else if (ergTryJson(line)) {
+                const d = flushEvent();
+                if (d) yield { data: d };
+                yield { data: line };
+            }
+        }
+        const d = flushEvent();
+        if (d) yield { data: d };
+    }
+
+    /** 从任意 OpenAI 兼容 chunk/响应里提取“正文文本”（思考不算正文）。 */
+    function ergExtractContentText(obj) {
+        if (!obj || typeof obj !== 'object') return '';
+        const parts = [];
+        const choices = Array.isArray(obj.choices) ? obj.choices : [];
+        for (const c of choices) {
+            let t = '';
+            const d = c && c.delta;
+            if (d) {
+                if (typeof d.content === 'string') t = d.content;
+                else if (Array.isArray(d.content)) t = d.content.map((p) => (p && typeof p.text === 'string') ? p.text : '').join('');
+                else if (typeof d.text === 'string') t = d.text;
+            } else {
+                const m = c && c.message;
+                if (m && typeof m.content === 'string') t = m.content;
+                else if (m && Array.isArray(m.content)) t = m.content.map((p) => (p && typeof p.text === 'string') ? p.text : '').join('');
+                else if (c && typeof c.text === 'string') t = c.text;
+            }
+            if (t) parts.push(t);
+        }
+        if (!parts.length && Array.isArray(obj.candidates)) {
+            const partsArr = obj.candidates[0]?.content?.parts;
+            if (Array.isArray(partsArr)) {
+                const t = partsArr.map((p) => (p && typeof p.text === 'string' && !p.thought) ? p.text : '').join('');
+                if (t) parts.push(t);
+            }
+        }
+        return parts.join('');
+    }
+
+    /** 是否包含工具调用(tool_calls)。 */
+    function ergHasToolCalls(obj) {
+        if (!obj || typeof obj !== 'object') return false;
+        const choices = Array.isArray(obj.choices) ? obj.choices : [];
+        for (const c of choices) {
+            if (!c) continue;
+            if (c.delta && Array.isArray(c.delta.tool_calls) && c.delta.tool_calls.length) return true;
+            if (c.message && Array.isArray(c.message.tool_calls) && c.message.tool_calls.length) return true;
+        }
+        return false;
+    }
+
+    /**
+     * 创建 fetch 守卫包装器（纯逻辑，可在 Node 测试）。
+     * @param {object} deps
+     *  - fetchImpl: 原始 fetch 实现
+     *  - getOptions(): {enabled, maxRetries, fallbackNonStream, delayMs}
+     *  - log(msg): void
+     *  - isTarget(inputStr, bodyJson): boolean —— 是否拦截此请求
+     * @returns {(input: any, init?: any) => Promise<Response>}
+     */
+    function createFetchGuard(deps) {
+        const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+        const TOOLCALL_HINT = '上游只返回了工具调用(tool calls)、没有正文内容。多半是当前客户端/预设开启了“工具/函数调用”而该中转站或渠道不支持，请关闭工具调用后再试。';
+
+        async function doFetch(input, init, bodyJson, stream) {
+            const req = (typeof input === 'string' || input instanceof URL)
+                ? new Request(String(input), { ...init, body: JSON.stringify({ ...bodyJson, stream: !!stream }) })
+                : new Request(input, { ...init, body: JSON.stringify({ ...bodyJson, stream: !!stream }) });
+            return await deps.fetchImpl(req);
+        }
+
+        function enq(controller, enc, s) { try { controller.enqueue(enc.encode(s)); } catch (_) { /* closed */ } }
+
+        async function handleStreaming(controller, enc, input, init, bodyJson, opts) {
+            const maxAttempts = 1 + Math.max(0, Number(opts.maxRetries) || 0);
+            for (let attempt = 0; attempt < maxAttempts; attempt++) {
+                if (attempt > 0) {
+                    deps.log('空流，第 ' + attempt + '/' + opts.maxRetries + ' 次自动重试（请求层）...');
+                    await sleep(opts.delayMs);
+                }
+                const resp = await doFetch(input, init, bodyJson, true);
+                if (!resp.ok) {
+                    const errText = await resp.clone().text().catch(() => '');
+                    deps.log('生成请求失败 status=' + resp.status);
+                    enq(controller, enc, 'data: ' + JSON.stringify({ error: { message: '生成请求失败：' + resp.status + ' ' + String(errText).slice(0, 200) } }) + '\n\n');
+                    return;
+                }
+                const outcome = await streamRewrite(controller, enc, resp);
+                if (outcome === 'ok') return;
+                if (outcome === 'toolcalls') {
+                    deps.log('上游只返回了工具调用，没有正文');
+                    enq(controller, enc, 'data: ' + JSON.stringify({ error: { message: TOOLCALL_HINT } }) + '\n\n');
+                    return;
+                }
+                if (outcome === 'error') return; // 错误已发给酒馆显示，不再重试
+                // 'empty' → 继续下一轮重试
+            }
+
+            if (opts.fallbackNonStream) {
+                deps.log('流式重试仍为空，改用非流式兜底...');
+                const resp = await doFetch(input, init, bodyJson, false);
+                if (resp.ok) {
+                    const json = await resp.json().catch(() => null);
+                    const text = json ? ergExtractContentText(json) : '';
+                    if (text) {
+                        const chunk = {
+                            id: (json && json.id) || ('chatcmpl-' + Date.now()),
+                            object: 'chat.completion.chunk',
+                            created: Math.floor(Date.now() / 1000),
+                            model: (json && json.model) || '',
+                            choices: [{ index: 0, delta: { role: 'assistant', content: text }, finish_reason: (json && json.choices && json.choices[0] && json.choices[0].finish_reason) || 'stop' }],
+                        };
+                        enq(controller, enc, 'data: ' + JSON.stringify(chunk) + '\n\n');
+                        deps.log('非流式兜底成功（已转成 SSE 回给酒馆）');
+                        return;
+                    }
+                    if (json && json.error) {
+                        enq(controller, enc, 'data: ' + JSON.stringify({ error: { message: json.error.message || '上游错误' } }) + '\n\n');
+                        return;
+                    }
+                }
+                deps.log('非流式兜底也失败');
+                enq(controller, enc, 'data: ' + JSON.stringify({ error: { message: '上游连续 ' + maxAttempts + ' 次返回空流，且非流式兜底失败（详情见控制台/扩展日志）' } }) + '\n\n');
+                return;
+            }
+            enq(controller, enc, 'data: ' + JSON.stringify({ error: { message: '上游连续 ' + maxAttempts + ' 次返回空流（空回守卫已自动重试，仍未成功）' } }) + '\n\n');
+        }
+
+        /** 消费上游流：缓冲至出现正文再开闸；返回 'ok' | 'empty' | 'toolcalls' | 'error'。 */
+        async function streamRewrite(controller, enc, resp) {
+            const reader = resp.body.getReader();
+            const decoder = new TextDecoder();
+            let contentSeen = false;
+            let toolCallsSeen = false;
+            let errorSeen = false;
+            let opened = false;
+            const pending = [];
+            const LIMIT = 400;
+            for await (const ev of ergParseSSE(reader, decoder)) {
+                const d = ev.data;
+                if (d === '[DONE]') break;
+                const json = ergTryJson(d);
+                if (json && json.error) {
+                    const msg = '上游在流内返回错误: ' + (json.error.message || '未知错误');
+                    deps.log(msg);
+                    const errSSE = 'data: ' + JSON.stringify({ error: { message: msg } }) + '\n\n';
+                    if (opened) enq(controller, enc, errSSE);
+                    else pending.push(errSSE);
+                    errorSeen = true;
+                    break;
+                }
+                if (ergHasToolCalls(json)) toolCallsSeen = true;
+                const text = ergExtractContentText(json);
+                const norm = 'data: ' + d + '\n\n';
+                if (text) {
+                    contentSeen = true;
+                    if (!opened) {
+                        for (const p of pending) enq(controller, enc, p);
+                        opened = true;
+                    }
+                    enq(controller, enc, norm);
+                } else if (opened) {
+                    enq(controller, enc, norm);
+                } else if (pending.length < LIMIT) {
+                    pending.push(norm);
+                }
+            }
+            try { await reader.cancel(); } catch (_) { /* ignore */ }
+            if (contentSeen) return 'ok';
+            if (errorSeen) {
+                // 未开闸时把缓冲（含错误信息）补发给酒馆，让酒馆显示真实报错
+                if (!opened) for (const p of pending) enq(controller, enc, p);
+                return 'error';
+            }
+            return toolCallsSeen ? 'toolcalls' : 'empty';
+        }
+
+        return async function guardedFetch(input, init) {
+            const opts = deps.getOptions();
+            if (!opts || !opts.enabled) return deps.fetchImpl(input, init);
+            let bodyJson = null;
+            try {
+                if (typeof input === 'string' || input instanceof URL) {
+                    if (init && typeof init.body === 'string') bodyJson = JSON.parse(init.body);
+                } else if (input instanceof Request && !input.bodyUsed) {
+                    bodyJson = JSON.parse(await input.clone().text());
+                }
+            } catch (_) { bodyJson = null; }
+            if (!bodyJson || !deps.isTarget(String(input), bodyJson)) {
+                return deps.fetchImpl(input, init);
+            }
+            deps.log('拦截生成请求（请求层修复）：model=' + (bodyJson.model || '(未指定)') + (Array.isArray(bodyJson.tools) && bodyJson.tools.length ? '（带 tools）' : ''));
+            const enc = new TextEncoder();
+            const out = new ReadableStream({
+                async start(controller) {
+                    try {
+                        await handleStreaming(controller, enc, input, init, bodyJson, opts);
+                    } catch (e) {
+                        enq(controller, enc, 'data: ' + JSON.stringify({ error: { message: '空回守卫请求层错误: ' + ((e && e.message) || e) } }) + '\n\n');
+                    } finally {
+                        enq(controller, enc, 'data: [DONE]\n\n');
+                        try { controller.close(); } catch (_) { /* already closed */ }
+                    }
+                },
+            });
+            return new Response(out, {
+                status: 200,
+                headers: { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-cache, no-store' },
+            });
+        };
+    }
+
+    // =========================================================
     // 浏览器/酒馆环境
     // =========================================================
     if (typeof global.document === 'undefined' || !global.document.documentElement) {
@@ -184,6 +450,7 @@
                 computeWaitMs,
                 friendlyError,
                 createRecoverySession,
+                createFetchGuard,
             };
         }
         return;
@@ -248,6 +515,7 @@
         settings.maxRetries = clampInt(settings.maxRetries, 0, 5, DEFAULTS.maxRetries);
         settings.retryDelayMs = clampInt(settings.retryDelayMs, 500, 30000, DEFAULTS.retryDelayMs);
         settings.backoffFactor = clampFloat(settings.backoffFactor, 1, 3, DEFAULTS.backoffFactor);
+        settings.fetchMaxRetries = clampInt(settings.fetchMaxRetries, 0, 5, DEFAULTS.fetchMaxRetries);
         if (typeof settings.handleTypes !== 'string') settings.handleTypes = DEFAULTS.handleTypes;
     }
 
@@ -453,6 +721,9 @@
             '  <div class="erg-row"><span>重试间隔(ms)</span><input type="number" id="erg_retry_delay" min="500" max="30000" step="500"></div>',
             '  <div class="erg-row"><span>退避系数</span><input type="number" id="erg_backoff" min="1" max="3" step="0.1"></div>',
             '  <label class="checkbox_label"><input type="checkbox" id="erg_fallback"> 常规重试失败后用非流式再试一次</label>',
+            '  <label class="checkbox_label"><input type="checkbox" id="erg_fetch_enable"> ⭐ 请求层修复（推荐：第一次就不空）</label>',
+            '  <div class="erg-row"><span>请求层重试次数</span><input type="number" id="erg_fetch_retries" min="0" max="5" step="1"></div>',
+            '  <label class="checkbox_label"><input type="checkbox" id="erg_fetch_fallback"> 请求层非流式兜底</label>',
             '  <label class="checkbox_label"><input type="checkbox" id="erg_placeholder"> 把「...」占位消息视为空回复</label>',
             '  <div class="erg-row"><span>处理的生成类型</span><input type="text" id="erg_handle_types" placeholder="normal, regenerate"></div>',
             '  <label class="checkbox_label"><input type="checkbox" id="erg_debug"> 调试日志（控制台）</label>',
@@ -474,6 +745,9 @@
         $('#erg_retry_delay').val(settings.retryDelayMs);
         $('#erg_backoff').val(settings.backoffFactor);
         $('#erg_fallback').prop('checked', !!settings.useNonStreamFallback);
+        $('#erg_fetch_enable').prop('checked', !!settings.enableFetchGuard);
+        $('#erg_fetch_retries').val(settings.fetchMaxRetries);
+        $('#erg_fetch_fallback').prop('checked', !!settings.fetchFallbackNonStream);
         $('#erg_placeholder').prop('checked', !!settings.treatPlaceholderAsEmpty);
         $('#erg_handle_types').val(settings.handleTypes);
         $('#erg_debug').prop('checked', !!settings.debug);
@@ -505,6 +779,19 @@
         });
         $('#erg_fallback').on('change', function () {
             settings.useNonStreamFallback = $(this).prop('checked');
+            saveSettings();
+        });
+        $('#erg_fetch_enable').on('change', function () {
+            settings.enableFetchGuard = $(this).prop('checked');
+            saveSettings();
+        });
+        $('#erg_fetch_retries').on('change', function () {
+            settings.fetchMaxRetries = clampInt($(this).val(), 0, 5, DEFAULTS.fetchMaxRetries);
+            $(this).val(settings.fetchMaxRetries);
+            saveSettings();
+        });
+        $('#erg_fetch_fallback').on('change', function () {
+            settings.fetchFallbackNonStream = $(this).prop('checked');
             saveSettings();
         });
         $('#erg_placeholder').on('change', function () {
@@ -619,6 +906,39 @@
         }
     }
 
+    // ---------- 请求层修复安装（v2.0） ----------
+    function isTargetFetch(urlStr, bodyJson) {
+        try {
+            const u = new URL(String(urlStr), global.location ? global.location.href : undefined);
+            const p = u.pathname;
+            return (p.endsWith('/chat/completions') || p.indexOf('/api/backends/chat-completions/generate') !== -1)
+                && bodyJson && bodyJson.stream === true && Array.isArray(bodyJson.messages);
+        } catch (_) { return false; }
+    }
+
+    function installFetchGuard() {
+        try {
+            if (typeof window === 'undefined' || typeof window.fetch !== 'function') return;
+            if (window.__ergFetchGuardInstalled) return;
+            window.__ergFetchGuardInstalled = true;
+            const originalFetch = window.fetch.bind(window);
+            window.fetch = createFetchGuard({
+                fetchImpl: originalFetch,
+                getOptions: () => ({
+                    enabled: !!settings.enabled && !!settings.enableFetchGuard,
+                    maxRetries: settings.fetchMaxRetries,
+                    fallbackNonStream: !!settings.fetchFallbackNonStream,
+                    delayMs: 1200,
+                }),
+                log: (msg) => { console.log('[空回守卫]', msg); recordEvent('fetch-guard', { msg }); },
+                isTarget: isTargetFetch,
+            });
+            debugLog('请求层修复已安装（window.fetch 已包装）');
+        } catch (e) {
+            console.warn('[空回守卫] 请求层修复安装失败：', e);
+        }
+    }
+
     // ---------- 初始化 ----------
     function tryInit(retriesLeft) {
         if (!global.SillyTavern || typeof global.SillyTavern.getContext !== 'function') {
@@ -637,6 +957,7 @@
             return;
         }
         loadSettings();
+        installFetchGuard();
         bindEvents();
         const $ = global.jQuery;
         if ($) {
