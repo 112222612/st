@@ -1,0 +1,659 @@
+/*!
+ * 空回守卫 Empty Reply Guard v1.0.0
+ * 自动检测并修复酒馆(SillyTavern)的“空回复”（仅供私人使用）。
+ * License: MIT
+ */
+(function (global) {
+    'use strict';
+
+    const PLUGIN_KEY = 'emptyReplyGuard';
+    const PLUGIN_NAME = '空回守卫 · Empty Reply Guard';
+    const VERSION = '1.0.0';
+
+    // =========================================================
+    // 默认设置（会合并进 extension_settings.emptyReplyGuard）
+    // =========================================================
+    const DEFAULTS = {
+        enabled: true,                 // 总开关
+        maxRetries: 2,                 // 常规 regenerate 重试次数（0-5）
+        useNonStreamFallback: true,    // 重试仍空时，临时关流式用非流式再试一次
+        retryDelayMs: 3500,            // 首次重试等待毫秒
+        backoffFactor: 1.6,            // 每次递增系数（指数退避）
+        treatPlaceholderAsEmpty: true, // 把 "..." 占位消息视为空回复
+        handleTypes: 'normal, regenerate', // 处理哪些生成类型（逗号分隔）
+        debug: false,                  // 控制台调试日志
+    };
+
+    // =========================================================
+    // 纯函数部分（Node 测试可直接 require 本文件使用）
+    // =========================================================
+
+    /** 判断一段文本是否“空”（含白字符与占位符）。 */
+    function isEmptyMessage(mes, opts) {
+        if (mes === null || mes === undefined) return true;
+        if (typeof mes !== 'string') mes = String(mes);
+        const t = mes.trim();
+        if (t.length === 0) return true;
+        if (opts && opts.treatPlaceholderAsEmpty) {
+            if (t === '...' || t === '…' || /^[.…]+$/.test(t)) return true;
+        }
+        return false;
+    }
+
+    /** 指数退避等待时间（毫秒），封顶 15s，避免一直等。 */
+    function computeWaitMs(baseMs, backoffFactor, attemptIndex) {
+        const raw = Math.round(baseMs * Math.pow(backoffFactor, attemptIndex));
+        return Math.max(0, Math.min(15000, raw));
+    }
+
+    /** 把各种形状的异常转成人类可读文本（ST 常 throw new Error(jsonObject)）。 */
+    function friendlyError(err) {
+        if (!err) return '未知错误';
+        if (typeof err === 'string') return err;
+        const m = err.message;
+        if (m && typeof m === 'object') {
+            return m.error?.message || m.message || safeJson(m, 300) || '未知错误';
+        }
+        if (m) {
+            // ST 的 tryParseStreamingError 会 throw new Error(jsonObject)，
+            // 此时 message 被引擎变成 '[object Object]'，真实信息在酒馆自己的红色 toast 里。
+            if (m === '[object Object]') {
+                return err.error?.message || '接口返回错误（详情见酒馆红色错误提示）';
+            }
+            return String(m);
+        }
+        if (err.error?.message) return String(err.error.message);
+        if (err.statusText) return String(err.statusText);
+        return safeJson(err, 300) || '未知错误';
+    }
+
+    function safeJson(value, maxLen) {
+        try {
+            const s = JSON.stringify(value);
+            if (!s) return '';
+            return s.length > maxLen ? s.slice(0, maxLen) + '…' : s;
+        } catch (_) {
+            return String(value) || '';
+        }
+    }
+
+    /**
+     * 创建一次“空回复恢复会话”。
+     * 依赖全部由外部注入，便于在 Node 中做单元测试。
+     *
+     * @param {object} deps
+     *  - isEnabled(): boolean           当前总开关
+     *  - getOpts(): object              当前设置快照 {maxRetries, useNonStreamFallback, retryDelayMs, backoffFactor, treatPlaceholderAsEmpty}
+     *  - getChat(): array               当前聊天消息数组（实时引用）
+     *  - isOpenAi(): boolean            当前源是否是 OpenAI 兼容
+     *  - generate(): Promise<void>      执行一次 regenerate（失败抛异常）
+     *  - setStreaming(value): Promise<boolean>  切换流式开关，返回是否成功
+     *  - notify(text, type): void       toast 提示：type ∈ info|warning|error|success
+     *  - recordError(err): void         记录异常
+     *  - recordEvent(name, extra): void 记录诊断事件
+     *  - isAborted(): boolean           是否已被用户中止（stop/发消息/换聊天等）
+     *  - delay(ms): Promise<void>       等待
+     * @returns {{ run: () => Promise<'recovered'|'failed'|'aborted'|'skipped'> }}
+     */
+    function createRecoverySession(deps) {
+        function lastState() {
+            const chat = deps.getChat();
+            const last = Array.isArray(chat) && chat.length ? chat[chat.length - 1] : null;
+            if (!last) return 'none';
+            if (last.is_user) return 'user';
+            if (last.is_system) return 'system';
+            return isEmptyMessage(last.mes, deps.getOpts()) ? 'empty' : 'content';
+        }
+
+        return {
+            async run() {
+                const opts0 = deps.getOpts();
+                if (!deps.isEnabled()) return 'skipped';
+                if (lastState() !== 'empty') return 'skipped';
+
+                const fallbackAvailable = !!opts0.useNonStreamFallback && deps.isOpenAi();
+                const totalAttempts = Math.max(0, Number(opts0.maxRetries) || 0) + (fallbackAvailable ? 1 : 0);
+                if (totalAttempts <= 0) return 'skipped';
+
+                deps.recordEvent('recovery-start', { attempts: totalAttempts, fallback: fallbackAvailable });
+
+                for (let attempt = 0; attempt < totalAttempts; attempt++) {
+                    if (deps.isAborted()) return 'aborted';
+
+                    const isFallback = attempt >= (Number(opts0.maxRetries) || 0);
+                    const waitMs = computeWaitMs(opts0.retryDelayMs, opts0.backoffFactor, attempt);
+                    deps.recordEvent('retry-scheduled', { attempt: attempt + 1, total: totalAttempts, isFallback, waitMs });
+                    deps.notify(
+                        '检测到空回复，' + Math.max(1, Math.round(waitMs / 1000)) + ' 秒后自动重试' +
+                        '（第 ' + (attempt + 1) + '/' + totalAttempts + ' 次' + (isFallback ? '，非流式回退' : '') + '）',
+                        'warning'
+                    );
+                    await deps.delay(waitMs);
+                    if (deps.isAborted()) return 'aborted';
+
+                    // 等待期间可能已被其它途径修复 / 用户操作改变了聊天
+                    const pre = lastState();
+                    if (pre === 'content') { deps.recordEvent('recovered-externally', {}); return 'recovered'; }
+                    if (pre === 'none' || pre === 'system') return 'skipped';
+
+                    let toggled = false;
+                    if (isFallback) {
+                        toggled = await deps.setStreaming(false);
+                        if (!toggled) {
+                            deps.notify('未能自动切换到非流式（未找到流式设置项）。若仍失败，可在 API 设置中手动关闭“流式(Streaming)”后手动重新生成。', 'warning');
+                        }
+                    }
+
+                    deps.recordEvent('generate', { attempt: attempt + 1, isFallback, streamingToggled: toggled });
+                    try {
+                        await deps.generate();
+                    } catch (err) {
+                        deps.recordError(err);
+                        deps.notify('第 ' + (attempt + 1) + ' 次重试失败：' + friendlyError(err), 'error');
+                    } finally {
+                        // 无论成败都恢复流式开关，避免影响用户后续使用
+                        if (toggled) {
+                            try { await deps.setStreaming(true); } catch (_) { /* ignore */ }
+                        }
+                    }
+
+                    if (deps.isAborted()) return 'aborted';
+
+                    const after = lastState();
+                    if (after === 'content') { deps.recordEvent('recovered', { attempt: attempt + 1, isFallback }); return 'recovered'; }
+                    if (after === 'none') return 'failed';
+                    // 'empty' 或 'user'（上一次生成报错导致无消息产出）→ 继续下一轮
+                }
+
+                deps.recordEvent('recovery-failed', { attempts: totalAttempts });
+                return 'failed';
+            },
+        };
+    }
+
+    // =========================================================
+    // 浏览器/酒馆环境
+    // =========================================================
+    if (typeof global.document === 'undefined' || !global.document.documentElement) {
+        // Node / 测试环境：只导出可测试部分
+        if (typeof module !== 'undefined' && module.exports) {
+            module.exports = {
+                VERSION,
+                DEFAULTS,
+                isEmptyMessage,
+                computeWaitMs,
+                friendlyError,
+                createRecoverySession,
+            };
+        }
+        return;
+    }
+
+    // ---------- 运行状态 ----------
+    const state = {
+        busy: false,          // 恢复会话进行中
+        abandoned: false,     // 用户中止
+        selfGenerating: false, // 正在执行我们发起的 regenerate（忽略其衍生事件）
+        session: null,
+        recentErrors: [],     // 最近错误（诊断用）
+        recentEvents: [],     // 最近事件（诊断用）
+        stats: { detected: 0, recovered: 0, failed: 0, attempts: 0 },
+    };
+
+    let settings = { ...DEFAULTS };
+    let ctx = null;
+
+    function debugLog(...args) {
+        if (settings.debug) console.debug('[EmptyReplyGuard]', ...args);
+    }
+
+    function recordError(err) {
+        state.recentErrors.push({ at: new Date().toISOString(), text: friendlyError(err) });
+        if (state.recentErrors.length > 10) state.recentErrors.shift();
+        debugLog('error:', err);
+    }
+
+    function recordEvent(name, extra) {
+        state.recentEvents.push({ at: new Date().toISOString(), name, ...(extra || {}) });
+        if (state.recentEvents.length > 40) state.recentEvents.shift();
+        debugLog('event:', name, extra || '');
+    }
+
+    function notify(text, type = 'info', timeout = 6000) {
+        recordEvent('toast', { text, type });
+        try {
+            const toastr = global.toastr;
+            if (toastr) {
+                const fn = toastr[type] || toastr.info;
+                fn.call(toastr, text, PLUGIN_NAME, { timeOut: timeout, extendedTimeOut: timeout + 3000 });
+            }
+        } catch (_) { /* toastr 不存在时静默 */ }
+        console.log('[' + PLUGIN_NAME + ']', text);
+    }
+
+    // ---------- 设置读写 ----------
+    function clampInt(v, min, max, fallback) {
+        const n = Number(v);
+        return Number.isFinite(n) ? Math.min(max, Math.max(min, Math.round(n))) : fallback;
+    }
+    function clampFloat(v, min, max, fallback) {
+        const n = Number(v);
+        return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : fallback;
+    }
+
+    function loadSettings() {
+        const ext = ctx && ctx.extensionSettings;
+        const stored = ext && ext[PLUGIN_KEY] ? ext[PLUGIN_KEY] : {};
+        settings = { ...DEFAULTS, ...stored };
+        settings.maxRetries = clampInt(settings.maxRetries, 0, 5, DEFAULTS.maxRetries);
+        settings.retryDelayMs = clampInt(settings.retryDelayMs, 500, 30000, DEFAULTS.retryDelayMs);
+        settings.backoffFactor = clampFloat(settings.backoffFactor, 1, 3, DEFAULTS.backoffFactor);
+        if (typeof settings.handleTypes !== 'string') settings.handleTypes = DEFAULTS.handleTypes;
+    }
+
+    function saveSettings() {
+        try {
+            if (!ctx || !ctx.extensionSettings) return;
+            ctx.extensionSettings[PLUGIN_KEY] = { ...settings };
+            if (typeof ctx.saveSettingsDebounced === 'function') ctx.saveSettingsDebounced();
+        } catch (e) {
+            debugLog('saveSettings failed', e);
+        }
+    }
+
+    // ---------- 流式开关 ----------
+    function findStreamingSink() {
+        // 1) 新版（1.13.5+/1.18）：getContext 直接暴露 chatCompletionSettings（即 oai_settings）
+        if (ctx && ctx.chatCompletionSettings && typeof ctx.chatCompletionSettings === 'object' && 'stream_openai' in ctx.chatCompletionSettings) {
+            return { kind: 'obj', obj: ctx.chatCompletionSettings };
+        }
+        // 2) 个别构建把 oai_settings 挂到了全局
+        if (global.oai_settings && typeof global.oai_settings === 'object' && 'stream_openai' in global.oai_settings) {
+            return { kind: 'obj', obj: global.oai_settings };
+        }
+        // 3) 老版本：退回 UI 复选框（候选 id）
+        const $ = global.jQuery;
+        if ($) {
+            const ids = ['#stream_toggle', '#stream_openai'];
+            for (const id of ids) {
+                const el = $(id);
+                if (el && el.length) return { kind: 'ui', el };
+            }
+            // 4) 在聊天补全设置面板里按可见文案找复选框（兜底）
+            const panel = $('#chat_completion_settings, #openai_settings').filter(':visible').first();
+            if (panel.length) {
+                const hit = panel.find('input[type=checkbox]').filter(function () {
+                    const label = $(this).closest('label').text() || '';
+                    return /streaming|流式|stream/i.test(label);
+                }).first();
+                if (hit.length) return { kind: 'ui', el: hit };
+            }
+        }
+        return null;
+    }
+
+    async function setStreaming(value) {
+        const sink = findStreamingSink();
+        if (!sink) return false;
+        try {
+            if (sink.kind === 'obj') {
+                sink.obj.stream_openai = !!value;
+                if (typeof ctx.saveSettingsDebounced === 'function') ctx.saveSettingsDebounced();
+            } else {
+                sink.el.prop('checked', !!value).trigger('change');
+            }
+            debugLog('stream_openai ->', !!value);
+            return true;
+        } catch (e) {
+            debugLog('setStreaming failed', e);
+            return false;
+        }
+    }
+
+    // ---------- 中止条件 ----------
+    function abandon(reason) {
+        if (!state.busy) return;
+        state.abandoned = true;
+        recordEvent('abandoned', { reason });
+        debugLog('aborted:', reason);
+    }
+
+    function isAborted() {
+        return state.abandoned;
+    }
+
+    // ---------- 恢复会话接线 ----------
+    function delay(ms) {
+        return new Promise((resolve) => setTimeout(resolve, ms));
+    }
+
+    function buildSessionDeps() {
+        return {
+            isEnabled: () => !!settings.enabled,
+            getOpts: () => ({ ...settings }),
+            getChat: () => (ctx && Array.isArray(ctx.chat) ? ctx.chat : []),
+            isOpenAi: () => ctx && ctx.mainApi === 'openai',
+            generate: async () => {
+                if (!ctx || typeof ctx.generate !== 'function') {
+                    throw new Error('当前版本未暴露 generate API（getContext().generate），无法自动重试。');
+                }
+                state.selfGenerating = true;
+                state.stats.attempts += 1;
+                try {
+                    // 官方“重新生成最后一条消息”入口：会先删除最后一条（空）消息再按原上下文生成
+                    await ctx.generate('regenerate', {});
+                } finally {
+                    state.selfGenerating = false;
+                }
+            },
+            setStreaming: (v) => setStreaming(v),
+            notify,
+            recordError,
+            recordEvent,
+            isAborted,
+            delay,
+        };
+    }
+
+    function refreshStatsUi() {
+        const el = global.document && document.getElementById('erg_stats');
+        if (!el) return;
+        const s = state.stats;
+        el.textContent = '检测空回复 ' + s.detected + ' 次 · 自动修复成功 ' + s.recovered + ' 次 · 失败 ' + s.failed + ' 次 · 共重试 ' + s.attempts + ' 次';
+    }
+
+    async function handleVerdict(verdict) {
+        debugLog('verdict:', verdict);
+        if (verdict === 'recovered') {
+            state.stats.recovered += 1;
+            notify('空回复已自动修复 ✔', 'success', 5000);
+        } else if (verdict === 'failed') {
+            state.stats.failed += 1;
+            const errs = state.recentErrors.slice(-3).map((e) => e.text);
+            notify(
+                '空回复自动修复失败（已重试）。' +
+                (errs.length ? '接口报错：' + errs.join(' | ') : '接口始终没有返回内容。') +
+                ' 建议点击设置面板“复制诊断信息”排查；也可在 API 设置中尝试关闭“流式(Streaming)”。',
+                'error', 12000
+            );
+        }
+        refreshStatsUi();
+    }
+
+    async function startRecoverySession() {
+        if (state.busy) return;
+        state.busy = true;
+        state.abandoned = false;
+        state.session = createRecoverySession(buildSessionDeps());
+        state.stats.detected += 1;
+        refreshStatsUi();
+        try {
+            const verdict = await state.session.run();
+            await handleVerdict(verdict);
+        } catch (e) {
+            recordError(e);
+            debugLog('recovery crashed', e);
+        } finally {
+            state.session = null;
+            state.busy = false;
+            refreshStatsUi();
+        }
+    }
+
+    // ---------- 事件接线 ----------
+    function handleMessageReceived(messageId, type) {
+        if (!settings.enabled || state.busy) return;
+        if (!ctx || !Array.isArray(ctx.chat)) return;
+
+        const normType = String(type ?? 'normal').toLowerCase();
+        const allowed = String(settings.handleTypes || '')
+            .split(',')
+            .map((x) => x.trim().toLowerCase())
+            .filter(Boolean);
+        if (!allowed.includes(normType)) return;
+
+        const idx = Number(messageId);
+        if (!Number.isInteger(idx) || idx < 0 || idx >= ctx.chat.length) return;
+        const msg = ctx.chat[idx];
+        if (!msg || msg.is_user || msg.is_system) return;
+        // 只处理“最后一条消息”为空的情况（regenerate 语义所在）
+        if (idx !== ctx.chat.length - 1) return;
+        if (!isEmptyMessage(msg.mes, settings)) return;
+
+        debugLog('empty reply detected:', idx, JSON.stringify(String(msg.mes).slice(0, 80)));
+        startRecoverySession();
+    }
+
+    function bindEvents() {
+        const et = ctx && (ctx.eventTypes || ctx.event_types);
+        if (!ctx || !ctx.eventSource || !et) {
+            notify('未找到 eventSource/eventTypes，空回守卫无法监听事件。', 'error');
+            return;
+        }
+        const on = (name, fn) => ctx.eventSource.on(et[name] ?? name, fn);
+
+        on('MESSAGE_RECEIVED', handleMessageReceived);
+        // 用户主动中止/切换 → 停止重试
+        on('GENERATION_STOPPED', () => { if (!state.selfGenerating) abandon('用户停止了生成'); });
+        on('MESSAGE_SENT', () => abandon('用户发送了新消息'));
+        on('MESSAGE_SWIPED', () => { if (!state.selfGenerating) abandon('用户切换了 swipes'); });
+        on('CHAT_CHANGED', () => abandon('切换了聊天'));
+        on('MESSAGE_DELETED', () => { if (!state.selfGenerating) abandon('消息被删除'); });
+        debugLog('events bound');
+    }
+
+    // ---------- 设置面板 UI ----------
+    function buildSettingsHtml() {
+        return [
+            '<div class="empty-reply-guard-settings">',
+            '  <h4 data-i18n="Empty Reply Guard">空回守卫 · Empty Reply Guard <small>v' + VERSION + '</small></h4>',
+            '  <small class="erg-hint">自动修复“空回复”（有输入没输出 / 只有 … 占位）：自动重试 → 必要时切非流式再试 → 实时显示接口真实报错。适用于 new-api / one-api / 各类中转站。</small>',
+            '  <label class="checkbox_label"><input type="checkbox" id="erg_enabled"> 启用自动修复</label>',
+            '  <div class="erg-row"><span>常规重试次数</span><input type="number" id="erg_max_retries" min="0" max="5" step="1"></div>',
+            '  <div class="erg-row"><span>重试间隔(ms)</span><input type="number" id="erg_retry_delay" min="500" max="30000" step="500"></div>',
+            '  <div class="erg-row"><span>退避系数</span><input type="number" id="erg_backoff" min="1" max="3" step="0.1"></div>',
+            '  <label class="checkbox_label"><input type="checkbox" id="erg_fallback"> 常规重试失败后用非流式再试一次</label>',
+            '  <label class="checkbox_label"><input type="checkbox" id="erg_placeholder"> 把「...」占位消息视为空回复</label>',
+            '  <div class="erg-row"><span>处理的生成类型</span><input type="text" id="erg_handle_types" placeholder="normal, regenerate"></div>',
+            '  <label class="checkbox_label"><input type="checkbox" id="erg_debug"> 调试日志（控制台）</label>',
+            '  <div class="erg-stats" id="erg_stats"></div>',
+            '  <div class="erg-buttons">',
+            '    <button id="erg_retry_now">立即重试上一条</button>',
+            '    <button id="erg_copy_diag">复制诊断信息</button>',
+            '    <button id="erg_reset_stats">清零统计</button>',
+            '  </div>',
+            '</div>',
+        ].join('\n');
+    }
+
+    function applySettingsToUi() {
+        const $ = global.jQuery;
+        if (!$) return;
+        $('#erg_enabled').prop('checked', !!settings.enabled);
+        $('#erg_max_retries').val(settings.maxRetries);
+        $('#erg_retry_delay').val(settings.retryDelayMs);
+        $('#erg_backoff').val(settings.backoffFactor);
+        $('#erg_fallback').prop('checked', !!settings.useNonStreamFallback);
+        $('#erg_placeholder').prop('checked', !!settings.treatPlaceholderAsEmpty);
+        $('#erg_handle_types').val(settings.handleTypes);
+        $('#erg_debug').prop('checked', !!settings.debug);
+        refreshStatsUi();
+    }
+
+    function bindSettingsUi() {
+        const $ = global.jQuery;
+        if (!$) return;
+        $('#erg_enabled').on('change', function () {
+            settings.enabled = $(this).prop('checked');
+            if (!settings.enabled) abandon('已禁用');
+            saveSettings();
+        });
+        $('#erg_max_retries').on('change', function () {
+            settings.maxRetries = clampInt($(this).val(), 0, 5, DEFAULTS.maxRetries);
+            $(this).val(settings.maxRetries);
+            saveSettings();
+        });
+        $('#erg_retry_delay').on('change', function () {
+            settings.retryDelayMs = clampInt($(this).val(), 500, 30000, DEFAULTS.retryDelayMs);
+            $(this).val(settings.retryDelayMs);
+            saveSettings();
+        });
+        $('#erg_backoff').on('change', function () {
+            settings.backoffFactor = clampFloat($(this).val(), 1, 3, DEFAULTS.backoffFactor);
+            $(this).val(settings.backoffFactor);
+            saveSettings();
+        });
+        $('#erg_fallback').on('change', function () {
+            settings.useNonStreamFallback = $(this).prop('checked');
+            saveSettings();
+        });
+        $('#erg_placeholder').on('change', function () {
+            settings.treatPlaceholderAsEmpty = $(this).prop('checked');
+            saveSettings();
+        });
+        $('#erg_handle_types').on('change', function () {
+            settings.handleTypes = String($(this).val() || '').trim() || DEFAULTS.handleTypes;
+            saveSettings();
+        });
+        $('#erg_debug').on('change', function () {
+            settings.debug = $(this).prop('checked');
+            saveSettings();
+        });
+        $('#erg_retry_now').on('click', function () {
+            if (state.busy) { notify('正在自动重试中，请稍候…', 'warning'); return; }
+            const chat = ctx && ctx.chat;
+            const last = Array.isArray(chat) && chat.length ? chat[chat.length - 1] : null;
+            if (!last || last.is_user || last.is_system || !isEmptyMessage(last.mes, settings)) {
+                notify('当前最后一条消息不是空回复，无需重试。', 'info');
+                return;
+            }
+            startRecoverySession();
+        });
+        $('#erg_copy_diag').on('click', copyDiagnostics);
+        $('#erg_reset_stats').on('click', function () {
+            state.stats = { detected: 0, recovered: 0, failed: 0, attempts: 0 };
+            state.recentErrors = [];
+            state.recentEvents = [];
+            refreshStatsUi();
+            notify('统计已清零。', 'info');
+        });
+    }
+
+    // ---------- 诊断 ----------
+    function buildDiagnostics() {
+        const cc = ctx && ctx.chatCompletionSettings ? ctx.chatCompletionSettings : null;
+        const chatTail = Array.isArray(ctx && ctx.chat) ? ctx.chat.slice(-6).map((m) => ({
+            is_user: !!m.is_user,
+            is_system: !!m.is_system,
+            len: (m.mes || '').length,
+            swipes: Array.isArray(m.swipes) ? m.swipes.length : null,
+        })) : [];
+        return {
+            plugin: { name: PLUGIN_NAME, version: VERSION },
+            generatedAt: new Date().toISOString(),
+            settings,
+            stats: { ...state.stats },
+            api: {
+                mainApi: ctx ? ctx.mainApi : null,
+                source: cc ? cc.chat_completion_source : null,
+                model: cc ? (cc.openai_model || cc.custom_model || null) : null,
+                streaming: cc ? cc.stream_openai : null,
+                url: cc ? (cc.custom_url || cc.reverse_proxy || null) : null,
+            },
+            recentErrors: state.recentErrors.slice(-10),
+            recentEvents: state.recentEvents.slice(-40),
+            chatTail,
+            hints: buildHints(),
+        };
+    }
+
+    function buildHints() {
+        const hints = [];
+        const cc = ctx && ctx.chatCompletionSettings ? ctx.chatCompletionSettings : null;
+        if (cc && cc.stream_openai === false && state.stats.failed > 0) {
+            hints.push('已处于非流式模式仍空回：通常说明接口确实没返回内容，请查看 recentErrors（例如额度/负载/模型名错误）。');
+        }
+        const errs = state.recentErrors.map((e) => e.text).join(' ');
+        if (/status 5\d\d|502|503|504|upstream|bad gateway|超时|timeout/i.test(errs)) {
+            hints.push('检测到 5xx/超时类报错：多为接口站或其上游渠道临时故障，重试通常可恢复。');
+        }
+        if (/quota|insufficient|额度|余额|429/i.test(errs)) {
+            hints.push('检测到额度/限流类报错：请检查接口站账户余额或订阅额度。');
+        }
+        if (/invalid token|401|403|key|密钥/i.test(errs)) {
+            hints.push('检测到鉴权报错：请检查酒馆里填写的 API Key / 自定义 Headers。');
+        }
+        if (/model|模型|not found/i.test(errs)) {
+            hints.push('检测到模型相关报错：请确认所选模型在该接口站确实可用（模型名一致）。');
+        }
+        return hints;
+    }
+
+    function copyDiagnostics() {
+        try {
+            const json = JSON.stringify(buildDiagnostics(), null, 2);
+            const done = () => notify('诊断信息已复制 ✔（可粘贴给接口站管理员或到反馈帖中）', 'success', 6000);
+            if (global.navigator && typeof navigator.clipboard.writeText === 'function') {
+                navigator.clipboard.writeText(json).then(done, () => legacyCopy(json, done));
+            } else {
+                legacyCopy(json, done);
+            }
+        } catch (e) {
+            notify('复制失败：' + friendlyError(e), 'error');
+        }
+    }
+
+    function legacyCopy(text, onDone) {
+        try {
+            const ta = document.createElement('textarea');
+            ta.value = text;
+            ta.style.position = 'fixed';
+            ta.style.opacity = '0';
+            document.body.appendChild(ta);
+            ta.select();
+            document.execCommand('copy');
+            document.body.removeChild(ta);
+            if (onDone) onDone();
+        } catch (e) {
+            notify('复制失败，请在控制台执行 EmptyReplyGuardDiag() 查看诊断。', 'error');
+        }
+    }
+
+    // ---------- 初始化 ----------
+    function tryInit(retriesLeft) {
+        if (!global.SillyTavern || typeof global.SillyTavern.getContext !== 'function') {
+            if (retriesLeft <= 0) {
+                console.warn('[' + PLUGIN_NAME + '] SillyTavern API 未就绪，初始化失败。');
+                return;
+            }
+            setTimeout(() => tryInit(retriesLeft - 1), 500);
+            return;
+        }
+        try {
+            ctx = global.SillyTavern.getContext();
+        } catch (e) {
+            console.warn('[' + PLUGIN_NAME + '] getContext() 失败，稍后重试。', e);
+            setTimeout(() => tryInit(retriesLeft - 1), 500);
+            return;
+        }
+        loadSettings();
+        bindEvents();
+        const $ = global.jQuery;
+        if ($) {
+            const $container = $('#extensions_settings');
+            if ($container.length) {
+                $container.append(buildSettingsHtml());
+                applySettingsToUi();
+                bindSettingsUi();
+            } else {
+                console.warn('[' + PLUGIN_NAME + '] 未找到 #extensions_settings 容器，设置面板未挂载。');
+            }
+        }
+        notify('空回守卫已加载（自动修复空回复）。', 'info', 4000);
+        console.log('[' + PLUGIN_NAME + '] v' + VERSION + ' loaded. 诊断: EmptyReplyGuardDiag()');
+        // 暴露诊断函数，方便用户在控制台调用
+        global.EmptyReplyGuardDiag = () => buildDiagnostics();
+    }
+
+    tryInit(40); // 最多等 20 秒
+})(typeof globalThis !== 'undefined' ? globalThis : this);

@@ -1,0 +1,56 @@
+/* 空回守卫 · Empty Reply Guard —— 设置面板样式 */
+.empty-reply-guard-settings {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 6px 0;
+}
+.empty-reply-guard-settings h4 {
+    margin: 0 0 2px;
+    font-size: 1.05em;
+}
+.empty-reply-guard-settings h4 small {
+    opacity: 0.65;
+    font-weight: normal;
+}
+.empty-reply-guard-settings .erg-hint {
+    opacity: 0.8;
+    line-height: 1.45;
+    margin-bottom: 4px;
+}
+.empty-reply-guard-settings .erg-hint code {
+    background: var(--black30, rgba(0, 0, 0, 0.3));
+    border-radius: 4px;
+    padding: 0 4px;
+}
+.empty-reply-guard-settings .erg-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+}
+.empty-reply-guard-settings .erg-row span {
+    font-size: 13px;
+    opacity: 0.9;
+}
+.empty-reply-guard-settings .erg-row input[type="number"],
+.empty-reply-guard-settings .erg-row input[type="text"] {
+    width: 110px;
+    text-align: right;
+}
+.empty-reply-guard-settings .erg-stats {
+    font-size: 12px;
+    opacity: 0.75;
+    line-height: 1.4;
+}
+.empty-reply-guard-settings .erg-buttons {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 4px;
+}
+.empty-reply-guard-settings .erg-buttons button {
+    font-size: 12px;
+    padding: 4px 10px;
+    border-radius: 8px;
+}
