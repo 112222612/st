@@ -1,9 +1,11 @@
 /*!
- * 空回守卫 Empty Reply Guard v2.0.0
- * 自动检测并修复酒馆(SillyTavern)的“空回复”（仅供私人使用）。
- * v2.0 新增“请求层修复”：包装 window.fetch，在生成请求到达酒馆解析器之前
+ * 空回守卫 Empty Reply Guard v2.1.0
+ * 自动检测并修复酒馆(SillyTavern)的"空回复"。
+ * v2.0 新增"请求层修复"：包装 window.fetch，在生成请求到达酒馆解析器之前
  * 就完成 空流自动重试 → 非流式兜底 → 格式修复 → 工具调用提示，
- * 让酒馆“第一次就不空”（纯本地运行，不依赖任何服务器）。
+ * 让酒馆"第一次就不空"（纯本地运行，不依赖任何服务器）。
+ * v2.1 新增 thinking 模型支持：识别 reasoning_content/reasoning/thinking 字段，
+ * 思考 chunk 立即放行，不再误判为空流。
  * License: MIT
  */
 (function (global) {
@@ -11,30 +13,29 @@
 
     const PLUGIN_KEY = 'emptyReplyGuard';
     const PLUGIN_NAME = '空回守卫 · Empty Reply Guard';
-    const VERSION = '2.0.0';
+    const VERSION = '2.1.0';
 
     // =========================================================
     // 默认设置（会合并进 extension_settings.emptyReplyGuard）
     // =========================================================
     const DEFAULTS = {
-        enabled: true,                 // 总开关
-        maxRetries: 2,                 // 常规 regenerate 重试次数（0-5）
-        useNonStreamFallback: true,    // 重试仍空时，临时关流式用非流式再试一次
-        retryDelayMs: 3500,            // 首次重试等待毫秒
-        backoffFactor: 1.6,            // 每次递增系数（指数退避）
-        treatPlaceholderAsEmpty: true, // 把 "..." 占位消息视为空回复
-        handleTypes: 'normal, regenerate', // 处理哪些生成类型（逗号分隔）
-        debug: false,                  // 控制台调试日志
-        enableFetchGuard: true,        // 请求层修复：拦截生成请求，第一次就不空
-        fetchMaxRetries: 2,            // 请求层空流自动重试次数（0-5）
-        fetchFallbackNonStream: true,  // 请求层重试仍空 → 用非流式兜底
+        enabled: true,
+        maxRetries: 2,
+        useNonStreamFallback: true,
+        retryDelayMs: 3500,
+        backoffFactor: 1.6,
+        treatPlaceholderAsEmpty: true,
+        handleTypes: 'normal, regenerate',
+        debug: false,
+        enableFetchGuard: true,
+        fetchMaxRetries: 2,
+        fetchFallbackNonStream: true,
     };
 
     // =========================================================
     // 纯函数部分（Node 测试可直接 require 本文件使用）
     // =========================================================
 
-    /** 判断一段文本是否“空”（含白字符与占位符）。 */
     function isEmptyMessage(mes, opts) {
         if (mes === null || mes === undefined) return true;
         if (typeof mes !== 'string') mes = String(mes);
@@ -46,13 +47,11 @@
         return false;
     }
 
-    /** 指数退避等待时间（毫秒），封顶 15s，避免一直等。 */
     function computeWaitMs(baseMs, backoffFactor, attemptIndex) {
         const raw = Math.round(baseMs * Math.pow(backoffFactor, attemptIndex));
         return Math.max(0, Math.min(15000, raw));
     }
 
-    /** 把各种形状的异常转成人类可读文本（ST 常 throw new Error(jsonObject)）。 */
     function friendlyError(err) {
         if (!err) return '未知错误';
         if (typeof err === 'string') return err;
@@ -61,8 +60,6 @@
             return m.error?.message || m.message || safeJson(m, 300) || '未知错误';
         }
         if (m) {
-            // ST 的 tryParseStreamingError 会 throw new Error(jsonObject)，
-            // 此时 message 被引擎变成 '[object Object]'，真实信息在酒馆自己的红色 toast 里。
             if (m === '[object Object]') {
                 return err.error?.message || '接口返回错误（详情见酒馆红色错误提示）';
             }
@@ -83,24 +80,6 @@
         }
     }
 
-    /**
-     * 创建一次“空回复恢复会话”。
-     * 依赖全部由外部注入，便于在 Node 中做单元测试。
-     *
-     * @param {object} deps
-     *  - isEnabled(): boolean           当前总开关
-     *  - getOpts(): object              当前设置快照 {maxRetries, useNonStreamFallback, retryDelayMs, backoffFactor, treatPlaceholderAsEmpty}
-     *  - getChat(): array               当前聊天消息数组（实时引用）
-     *  - isOpenAi(): boolean            当前源是否是 OpenAI 兼容
-     *  - generate(): Promise<void>      执行一次 regenerate（失败抛异常）
-     *  - setStreaming(value): Promise<boolean>  切换流式开关，返回是否成功
-     *  - notify(text, type): void       toast 提示：type ∈ info|warning|error|success
-     *  - recordError(err): void         记录异常
-     *  - recordEvent(name, extra): void 记录诊断事件
-     *  - isAborted(): boolean           是否已被用户中止（stop/发消息/换聊天等）
-     *  - delay(ms): Promise<void>       等待
-     * @returns {{ run: () => Promise<'recovered'|'failed'|'aborted'|'skipped'> }}
-     */
     function createRecoverySession(deps) {
         function lastState() {
             const chat = deps.getChat();
@@ -137,7 +116,6 @@
                     await deps.delay(waitMs);
                     if (deps.isAborted()) return 'aborted';
 
-                    // 等待期间可能已被其它途径修复 / 用户操作改变了聊天
                     const pre = lastState();
                     if (pre === 'content') { deps.recordEvent('recovered-externally', {}); return 'recovered'; }
                     if (pre === 'none' || pre === 'system') return 'skipped';
@@ -146,7 +124,7 @@
                     if (isFallback) {
                         toggled = await deps.setStreaming(false);
                         if (!toggled) {
-                            deps.notify('未能自动切换到非流式（未找到流式设置项）。若仍失败，可在 API 设置中手动关闭“流式(Streaming)”后手动重新生成。', 'warning');
+                            deps.notify('未能自动切换到非流式（未找到流式设置项）。若仍失败，可在 API 设置中手动关闭"流式(Streaming)"后手动重新生成。', 'warning');
                         }
                     }
 
@@ -157,7 +135,6 @@
                         deps.recordError(err);
                         deps.notify('第 ' + (attempt + 1) + ' 次重试失败：' + friendlyError(err), 'error');
                     } finally {
-                        // 无论成败都恢复流式开关，避免影响用户后续使用
                         if (toggled) {
                             try { await deps.setStreaming(true); } catch (_) { /* ignore */ }
                         }
@@ -168,7 +145,6 @@
                     const after = lastState();
                     if (after === 'content') { deps.recordEvent('recovered', { attempt: attempt + 1, isFallback }); return 'recovered'; }
                     if (after === 'none') return 'failed';
-                    // 'empty' 或 'user'（上一次生成报错导致无消息产出）→ 继续下一轮
                 }
 
                 deps.recordEvent('recovery-failed', { attempts: totalAttempts });
@@ -178,14 +154,13 @@
     }
 
     // =========================================================
-    // v2.0 请求层修复：包装 window.fetch，让酒馆“第一次就不空”
+    // v2.0 请求层修复：包装 window.fetch，让酒馆"第一次就不空"
     // =========================================================
 
     function ergTryJson(s) {
         try { return JSON.parse(s); } catch { return null; }
     }
 
-    /** 按行解析 SSE（兼容标准 SSE 与 ndjson / 纯 JSON 行）。 */
     async function* ergParseSSE(reader, decoder) {
         let buffer = '';
         let pendingLines = [];
@@ -234,7 +209,6 @@
         if (d) yield { data: d };
     }
 
-    /** 从任意 OpenAI 兼容 chunk/响应里提取“正文文本”（思考不算正文）。 */
     function ergExtractContentText(obj) {
         if (!obj || typeof obj !== 'object') return '';
         const parts = [];
@@ -264,7 +238,6 @@
         return parts.join('');
     }
 
-    /** 是否包含工具调用(tool_calls)。 */
     function ergHasToolCalls(obj) {
         if (!obj || typeof obj !== 'object') return false;
         const choices = Array.isArray(obj.choices) ? obj.choices : [];
@@ -276,18 +249,24 @@
         return false;
     }
 
-    /**
-     * 创建 fetch 守卫包装器（纯逻辑，可在 Node 测试）。
-     * @param {object} deps
-     *  - fetchImpl: 原始 fetch 实现
-     *  - getOptions(): {enabled, maxRetries, fallbackNonStream, delayMs}
-     *  - log(msg): void
-     *  - isTarget(inputStr, bodyJson): boolean —— 是否拦截此请求
-     * @returns {(input: any, init?: any) => Promise<Response>}
-     */
+    /** 是否包含思考/推理内容（reasoning_content / reasoning / thinking）。 */
+    function ergHasThinking(obj) {
+        if (!obj || typeof obj !== 'object') return false;
+        const choices = Array.isArray(obj.choices) ? obj.choices : [];
+        for (const c of choices) {
+            if (!c) continue;
+            const d = c.delta || c.message;
+            if (!d) continue;
+            if (typeof d.reasoning_content === 'string' && d.reasoning_content) return true;
+            if (typeof d.reasoning === 'string' && d.reasoning) return true;
+            if (typeof d.thinking === 'string' && d.thinking) return true;
+        }
+        return false;
+    }
+
     function createFetchGuard(deps) {
         const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-        const TOOLCALL_HINT = '上游只返回了工具调用(tool calls)、没有正文内容。多半是当前客户端/预设开启了“工具/函数调用”而该中转站或渠道不支持，请关闭工具调用后再试。';
+        const TOOLCALL_HINT = '上游只返回了工具调用(tool calls)、没有正文内容。多半是当前客户端/预设开启了"工具/函数调用"而该中转站或渠道不支持，请关闭工具调用后再试。';
 
         async function doFetch(input, init, bodyJson, stream) {
             const req = (typeof input === 'string' || input instanceof URL)
@@ -314,12 +293,19 @@
                 }
                 const outcome = await streamRewrite(controller, enc, resp);
                 if (outcome === 'ok') return;
+                if (outcome === 'thinking-only') {
+                    deps.log('上游只返回了思考内容，没有正文（thinking-only）');
+                    enq(controller, enc, 'data: ' + JSON.stringify({
+                        error: { message: '上游模型只输出了思考(reasoning)、没有正文内容。可能是思考链过长导致流中断，建议：1) 缩短预设/上下文 2) 调长超时时间 3) 换用不带 thinking 的模型' }
+                    }) + '\n\n');
+                    return;
+                }
                 if (outcome === 'toolcalls') {
                     deps.log('上游只返回了工具调用，没有正文');
                     enq(controller, enc, 'data: ' + JSON.stringify({ error: { message: TOOLCALL_HINT } }) + '\n\n');
                     return;
                 }
-                if (outcome === 'error') return; // 错误已发给酒馆显示，不再重试
+                if (outcome === 'error') return;
                 // 'empty' → 继续下一轮重试
             }
 
@@ -353,11 +339,12 @@
             enq(controller, enc, 'data: ' + JSON.stringify({ error: { message: '上游连续 ' + maxAttempts + ' 次返回空流（空回守卫已自动重试，仍未成功）' } }) + '\n\n');
         }
 
-        /** 消费上游流：缓冲至出现正文再开闸；返回 'ok' | 'empty' | 'toolcalls' | 'error'。 */
+        /** 消费上游流：缓冲至出现正文或思考再开闸；返回 'ok' | 'empty' | 'thinking-only' | 'toolcalls' | 'error'。 */
         async function streamRewrite(controller, enc, resp) {
             const reader = resp.body.getReader();
             const decoder = new TextDecoder();
             let contentSeen = false;
+            let thinkingSeen = false;
             let toolCallsSeen = false;
             let errorSeen = false;
             let opened = false;
@@ -377,10 +364,19 @@
                     break;
                 }
                 if (ergHasToolCalls(json)) toolCallsSeen = true;
+                const hasThinking = ergHasThinking(json);
+                if (hasThinking) thinkingSeen = true;
                 const text = ergExtractContentText(json);
                 const norm = 'data: ' + d + '\n\n';
                 if (text) {
                     contentSeen = true;
+                    if (!opened) {
+                        for (const p of pending) enq(controller, enc, p);
+                        opened = true;
+                    }
+                    enq(controller, enc, norm);
+                } else if (hasThinking) {
+                    // 思考 chunk：立即开闸放行，防止缓冲溢出和超时
                     if (!opened) {
                         for (const p of pending) enq(controller, enc, p);
                         opened = true;
@@ -395,10 +391,10 @@
             try { await reader.cancel(); } catch (_) { /* ignore */ }
             if (contentSeen) return 'ok';
             if (errorSeen) {
-                // 未开闸时把缓冲（含错误信息）补发给酒馆，让酒馆显示真实报错
                 if (!opened) for (const p of pending) enq(controller, enc, p);
                 return 'error';
             }
+            if (thinkingSeen) return 'thinking-only';
             return toolCallsSeen ? 'toolcalls' : 'empty';
         }
 
@@ -441,7 +437,6 @@
     // 浏览器/酒馆环境
     // =========================================================
     if (typeof global.document === 'undefined' || !global.document.documentElement) {
-        // Node / 测试环境：只导出可测试部分
         if (typeof module !== 'undefined' && module.exports) {
             module.exports = {
                 VERSION,
@@ -458,12 +453,12 @@
 
     // ---------- 运行状态 ----------
     const state = {
-        busy: false,          // 恢复会话进行中
-        abandoned: false,     // 用户中止
-        selfGenerating: false, // 正在执行我们发起的 regenerate（忽略其衍生事件）
+        busy: false,
+        abandoned: false,
+        selfGenerating: false,
         session: null,
-        recentErrors: [],     // 最近错误（诊断用）
-        recentEvents: [],     // 最近事件（诊断用）
+        recentErrors: [],
+        recentEvents: [],
         stats: { detected: 0, recovered: 0, failed: 0, attempts: 0 },
     };
 
@@ -531,15 +526,12 @@
 
     // ---------- 流式开关 ----------
     function findStreamingSink() {
-        // 1) 新版（1.13.5+/1.18）：getContext 直接暴露 chatCompletionSettings（即 oai_settings）
         if (ctx && ctx.chatCompletionSettings && typeof ctx.chatCompletionSettings === 'object' && 'stream_openai' in ctx.chatCompletionSettings) {
             return { kind: 'obj', obj: ctx.chatCompletionSettings };
         }
-        // 2) 个别构建把 oai_settings 挂到了全局
         if (global.oai_settings && typeof global.oai_settings === 'object' && 'stream_openai' in global.oai_settings) {
             return { kind: 'obj', obj: global.oai_settings };
         }
-        // 3) 老版本：退回 UI 复选框（候选 id）
         const $ = global.jQuery;
         if ($) {
             const ids = ['#stream_toggle', '#stream_openai'];
@@ -547,7 +539,6 @@
                 const el = $(id);
                 if (el && el.length) return { kind: 'ui', el };
             }
-            // 4) 在聊天补全设置面板里按可见文案找复选框（兜底）
             const panel = $('#chat_completion_settings, #openai_settings').filter(':visible').first();
             if (panel.length) {
                 const hit = panel.find('input[type=checkbox]').filter(function () {
@@ -608,7 +599,6 @@
                 state.selfGenerating = true;
                 state.stats.attempts += 1;
                 try {
-                    // 官方“重新生成最后一条消息”入口：会先删除最后一条（空）消息再按原上下文生成
                     await ctx.generate('regenerate', {});
                 } finally {
                     state.selfGenerating = false;
@@ -641,7 +631,7 @@
             notify(
                 '空回复自动修复失败（已重试）。' +
                 (errs.length ? '接口报错：' + errs.join(' | ') : '接口始终没有返回内容。') +
-                ' 建议点击设置面板“复制诊断信息”排查；也可在 API 设置中尝试关闭“流式(Streaming)”。',
+                ' 建议点击设置面板"复制诊断信息"排查；也可在 API 设置中尝试关闭"流式(Streaming)"。',
                 'error', 12000
             );
         }
@@ -684,7 +674,6 @@
         if (!Number.isInteger(idx) || idx < 0 || idx >= ctx.chat.length) return;
         const msg = ctx.chat[idx];
         if (!msg || msg.is_user || msg.is_system) return;
-        // 只处理“最后一条消息”为空的情况（regenerate 语义所在）
         if (idx !== ctx.chat.length - 1) return;
         if (!isEmptyMessage(msg.mes, settings)) return;
 
@@ -701,7 +690,6 @@
         const on = (name, fn) => ctx.eventSource.on(et[name] ?? name, fn);
 
         on('MESSAGE_RECEIVED', handleMessageReceived);
-        // 用户主动中止/切换 → 停止重试
         on('GENERATION_STOPPED', () => { if (!state.selfGenerating) abandon('用户停止了生成'); });
         on('MESSAGE_SENT', () => abandon('用户发送了新消息'));
         on('MESSAGE_SWIPED', () => { if (!state.selfGenerating) abandon('用户切换了 swipes'); });
@@ -715,7 +703,7 @@
         return [
             '<div class="empty-reply-guard-settings">',
             '  <h4 data-i18n="Empty Reply Guard">空回守卫 · Empty Reply Guard <small>v' + VERSION + '</small></h4>',
-            '  <small class="erg-hint">自动修复“空回复”（有输入没输出 / 只有 … 占位）：自动重试 → 必要时切非流式再试 → 实时显示接口真实报错。适用于 new-api / one-api / 各类中转站。</small>',
+            '  <small class="erg-hint">自动修复"空回复"（有输入没输出 / 只有 … 占位）：自动重试 → 必要时切非流式再试 → 实时显示接口真实报错。适用于 new-api / one-api / 各类中转站。</small>',
             '  <label class="checkbox_label"><input type="checkbox" id="erg_enabled"> 启用自动修复</label>',
             '  <div class="erg-row"><span>常规重试次数</span><input type="number" id="erg_max_retries" min="0" max="5" step="1"></div>',
             '  <div class="erg-row"><span>重试间隔(ms)</span><input type="number" id="erg_retry_delay" min="500" max="30000" step="500"></div>',
@@ -972,9 +960,8 @@
         }
         notify('空回守卫已加载（自动修复空回复）。', 'info', 4000);
         console.log('[' + PLUGIN_NAME + '] v' + VERSION + ' loaded. 诊断: EmptyReplyGuardDiag()');
-        // 暴露诊断函数，方便用户在控制台调用
         global.EmptyReplyGuardDiag = () => buildDiagnostics();
     }
 
-    tryInit(40); // 最多等 20 秒
+    tryInit(40);
 })(typeof globalThis !== 'undefined' ? globalThis : this);
