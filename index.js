@@ -1,9 +1,11 @@
 /*!
- * 空回守卫 Empty Reply Guard v2.0.0
+ * 空回守卫 Empty Reply Guard v2.2.0
  * 自动检测并修复酒馆(SillyTavern)的“空回复”（仅供私人使用）。
  * v2.0 新增“请求层修复”：包装 window.fetch，在生成请求到达酒馆解析器之前
  * 就完成 空流自动重试 → 非流式兜底 → 格式修复 → 工具调用提示，
  * 让酒馆“第一次就不空”（纯本地运行，不依赖任何服务器）。
+ * v2.2 新增：把“空流类错误”（如 empty_stream: 上游返回空流(无 contentBlock)，
+ * 常见于中转站 Claude 渠道）也纳入自动重试/非流式兜底，而不是透传报错。
  * License: MIT
  */
 (function (global) {
@@ -11,7 +13,7 @@
 
     const PLUGIN_KEY = 'emptyReplyGuard';
     const PLUGIN_NAME = '空回守卫 · Empty Reply Guard';
-    const VERSION = '2.0.0';
+    const VERSION = '2.2.0';
 
     // =========================================================
     // 默认设置（会合并进 extension_settings.emptyReplyGuard）
@@ -277,6 +279,16 @@
     }
 
     /**
+     * 判断错误消息是否为“空流类”错误（中转站 Claude 渠道常见）：
+     *   empty_stream: 上游返回空流 (无 contentBlock) / 空流 / empty response ...
+     * 这类错误应视为“空流”处理（自动重试 + 非流式兜底），而不是透传给酒馆报错。
+     */
+    function ergIsEmptyStreamError(msg) {
+        const m = String(msg || '');
+        return /empty[\s_-]?stream|空流|no content[\s_-]?block|empty response|无 contentblock|stream.*empty/i.test(m);
+    }
+
+    /**
      * 创建 fetch 守卫包装器（纯逻辑，可在 Node 测试）。
      * @param {object} deps
      *  - fetchImpl: 原始 fetch 实现
@@ -325,28 +337,47 @@
 
             if (opts.fallbackNonStream) {
                 deps.log('流式重试仍为空，改用非流式兜底...');
-                const resp = await doFetch(input, init, bodyJson, false);
-                if (resp.ok) {
-                    const json = await resp.json().catch(() => null);
-                    const text = json ? ergExtractContentText(json) : '';
-                    if (text) {
-                        const chunk = {
-                            id: (json && json.id) || ('chatcmpl-' + Date.now()),
-                            object: 'chat.completion.chunk',
-                            created: Math.floor(Date.now() / 1000),
-                            model: (json && json.model) || '',
-                            choices: [{ index: 0, delta: { role: 'assistant', content: text }, finish_reason: (json && json.choices && json.choices[0] && json.choices[0].finish_reason) || 'stop' }],
-                        };
-                        enq(controller, enc, 'data: ' + JSON.stringify(chunk) + '\n\n');
-                        deps.log('非流式兜底成功（已转成 SSE 回给酒馆）');
-                        return;
+                // 非流式兜底最多尝试 2 次（空流类错误 / 5xx / 空内容时再来一次）
+                const fallbackTries = 2;
+                for (let t = 0; t < fallbackTries; t++) {
+                    if (t > 0) {
+                        deps.log('非流式兜底第 ' + (t + 1) + '/' + fallbackTries + ' 次...');
+                        await sleep(opts.delayMs);
                     }
-                    if (json && json.error) {
-                        enq(controller, enc, 'data: ' + JSON.stringify({ error: { message: json.error.message || '上游错误' } }) + '\n\n');
-                        return;
+                    const resp = await doFetch(input, init, bodyJson, false);
+                    if (resp.ok) {
+                        const json = await resp.json().catch(() => null);
+                        const text = json ? ergExtractContentText(json) : '';
+                        if (text) {
+                            const chunk = {
+                                id: (json && json.id) || ('chatcmpl-' + Date.now()),
+                                object: 'chat.completion.chunk',
+                                created: Math.floor(Date.now() / 1000),
+                                model: (json && json.model) || '',
+                                choices: [{ index: 0, delta: { role: 'assistant', content: text }, finish_reason: (json && json.choices && json.choices[0] && json.choices[0].finish_reason) || 'stop' }],
+                            };
+                            enq(controller, enc, 'data: ' + JSON.stringify(chunk) + '\n\n');
+                            deps.log('非流式兜底成功（已转成 SSE 回给酒馆）');
+                            return;
+                        }
+                        if (json && json.error) {
+                            const rawMsg = String(json.error.message || '');
+                            if (ergIsEmptyStreamError(rawMsg) && t < fallbackTries - 1) {
+                                deps.log('兜底遇到空流类错误，继续重试');
+                                continue;
+                            }
+                            enq(controller, enc, 'data: ' + JSON.stringify({ error: { message: json.error.message || '上游错误' } }) + '\n\n');
+                            return;
+                        }
+                        // 响应 200 但无正文且无错误信息：再试一次
+                        if (t < fallbackTries - 1) continue;
+                    } else if (resp.status >= 500 && t < fallbackTries - 1) {
+                        deps.log('兜底请求 5xx，继续重试');
+                        continue;
                     }
+                    enq(controller, enc, 'data: ' + JSON.stringify({ error: { message: '非流式兜底失败（上游返回 ' + resp.status + '，详情见控制台/扩展日志）' } }) + '\n\n');
+                    return;
                 }
-                deps.log('非流式兜底也失败');
                 enq(controller, enc, 'data: ' + JSON.stringify({ error: { message: '上游连续 ' + maxAttempts + ' 次返回空流，且非流式兜底失败（详情见控制台/扩展日志）' } }) + '\n\n');
                 return;
             }
@@ -368,8 +399,15 @@
                 if (d === '[DONE]') break;
                 const json = ergTryJson(d);
                 if (json && json.error) {
-                    const msg = '上游在流内返回错误: ' + (json.error.message || '未知错误');
+                    const rawMsg = String(json.error.message || json.error.type || '未知错误');
+                    const msg = '上游在流内返回错误: ' + rawMsg;
                     deps.log(msg);
+                    // 空流类错误（中转站 Claude 渠道常见，如 "empty_stream: 上游返回空流 (无 contentBlock)"）
+                    // → 当作“空流”处理，走自动重试/非流式兜底，而不是透传报错
+                    if (!opened && ergIsEmptyStreamError(rawMsg)) {
+                        deps.log('识别为空流类错误，按空流处理（自动重试 / 非流式兜底）');
+                        return 'empty';
+                    }
                     const errSSE = 'data: ' + JSON.stringify({ error: { message: msg } }) + '\n\n';
                     if (opened) enq(controller, enc, errSSE);
                     else pending.push(errSSE);
