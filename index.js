@@ -29,6 +29,9 @@
  * v2.15 修复：诊断里的模型字段——custom 源优先读 custom_model（openai_model 是
  * 未使用的僵尸默认值 gpt-4-turbo，曾导致误报）；并新增 lastRequestedModel 从
  * fetch-guard 日志提取最近一次真实发送的模型。
+ * v2.16 补充：预设参数死角——n（多刷）与 response_format（JSON 模式）对
+ * new-api Claude 渠道支持差易空流；纳入请求清洗列表。并防御性支持
+ * text-completion 请求体（prompt 字符串）的拦截清洗。
  * License: MIT
  */
 (function (global) {
@@ -36,7 +39,7 @@
 
     const PLUGIN_KEY = 'emptyReplyGuard';
     const PLUGIN_NAME = '空回守卫 · Empty Reply Guard';
-    const VERSION = '2.15.0';
+    const VERSION = '2.16.0';
 
     // =========================================================
     // 默认设置（会合并进 extension_settings.emptyReplyGuard）
@@ -563,8 +566,8 @@
             if (prefixChanged) {
                 deps.log('检测到带 anthropic/ 前缀模型，自动改为无前缀发送: ' + sendBody.model);
             }
-            if (opts.bodySanitize && (('stop' in bodyJson) || ('logit_bias' in bodyJson) || ('presence_penalty' in bodyJson) || ('frequency_penalty' in bodyJson) || ('top_p' in bodyJson))) {
-                deps.log('已移除高危附加参数（stop/logit_bias/penalties/top_p 等），避免触发上游空流');
+            if (opts.bodySanitize && HIGH_RISK_PARAMS.some((k) => Object.prototype.hasOwnProperty.call(bodyJson, k))) {
+                deps.log('已移除高危附加参数（stop/logit_bias/penalties/top_p/n/response_format 等），避免触发上游空流');
             }
             // v2.8.0 长输出保护：单轮 max_tokens 过大 → 发送前钳制（防止超长输出撞爆渠道超时）
             const maxOut = Number(opts.maxOutputTokens) || 0;
@@ -794,7 +797,7 @@
     }
 
     /** 高危附加参数（实测会触发 new-api Claude 渠道 empty_stream）。 */
-    const HIGH_RISK_PARAMS = ['stop', 'logit_bias', 'presence_penalty', 'frequency_penalty', 'top_p', 'top_k', 'seed', 'logprobs'];
+    const HIGH_RISK_PARAMS = ['stop', 'logit_bias', 'presence_penalty', 'frequency_penalty', 'top_p', 'top_k', 'seed', 'logprobs', 'n', 'response_format'];
 
     /**
      * 清洗请求体为“最稳最小集”（实测 A 组合 3/3 稳定）。
@@ -1840,7 +1843,8 @@
             const p = u.pathname;
             // v2.4.0：流式与非流式生成请求都接管（关流式的用户同样有请求层修复）
             return (p.endsWith('/chat/completions') || p.indexOf('/api/backends/chat-completions/generate') !== -1)
-                && bodyJson && typeof bodyJson.stream === 'boolean' && Array.isArray(bodyJson.messages);
+                && bodyJson && typeof bodyJson.stream === 'boolean'
+                && (Array.isArray(bodyJson.messages) || typeof bodyJson.prompt === 'string');
         } catch (_) { return false; }
     }
 
