@@ -26,6 +26,9 @@
  * 等附加参数会触发 new-api Claude 渠道空流；发送前移除这些参数，只保留最稳的最小集。
  * v2.14 新增：拦截统计战报 + 一键自检——记录每次自动修复的数量与原因，
  * 一键生成可粘贴的 Markdown 报告；一键自检当前线路/参数组合是否健康。
+ * v2.15 修复：诊断里的模型字段——custom 源优先读 custom_model（openai_model 是
+ * 未使用的僵尸默认值 gpt-4-turbo，曾导致误报）；并新增 lastRequestedModel 从
+ * fetch-guard 日志提取最近一次真实发送的模型。
  * License: MIT
  */
 (function (global) {
@@ -33,7 +36,7 @@
 
     const PLUGIN_KEY = 'emptyReplyGuard';
     const PLUGIN_NAME = '空回守卫 · Empty Reply Guard';
-    const VERSION = '2.14.0';
+    const VERSION = '2.15.0';
 
     // =========================================================
     // 默认设置（会合并进 extension_settings.emptyReplyGuard）
@@ -754,6 +757,19 @@
         return out;
     }
 
+    /** 从事件列表提取最近一次 fetch-guard 真实请求的模型名。 */
+    function extractLastRequestedModel(events) {
+        let model = null;
+        if (!Array.isArray(events)) return model;
+        for (const ev of events) {
+            if (ev && ev.name === 'fetch-guard' && typeof ev.msg === 'string') {
+                const m = /model=([^\s（(]+)/.exec(ev.msg);
+                if (m) model = m[1];
+            }
+        }
+        return model;
+    }
+
     /** 生成可粘贴的 Markdown 战报（纯函数，可单测）。 */
     function buildReportText(payload) {
         const c = payload.counters || {};
@@ -836,6 +852,7 @@
                 sanitizeRequestBody,
                 HIGH_RISK_PARAMS,
                 buildReportText,
+                extractLastRequestedModel,
             };
         }
         return;
@@ -1700,9 +1717,11 @@
             api: {
                 mainApi: ctx ? ctx.mainApi : null,
                 source: cc ? cc.chat_completion_source : null,
-                model: cc ? (cc.openai_model || cc.custom_model || null) : null,
+                // v2.15: custom 源优先读 custom_model（openai_model 是未使用的僵尸默认值）
+                model: cc ? (cc.chat_completion_source === 'custom' ? (cc.custom_model || cc.openai_model || null) : (cc.openai_model || cc.custom_model || null)) : null,
                 streaming: cc ? cc.stream_openai : null,
                 url: cc ? (cc.custom_url || cc.reverse_proxy || null) : null,
+                lastRequestedModel: extractLastRequestedModel(state.recentEvents),
             },
             recentErrors: state.recentErrors.slice(-10),
             recentEvents: state.recentEvents.slice(-60),
