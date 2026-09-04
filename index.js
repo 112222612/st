@@ -21,7 +21,9 @@
  * v2.11 新增：永续重试——修复失败后进入后台自动重试（间隔递增，最长 30 分钟），
  * 线路一恢复自动把回复补进聊天，用户无需盯屏等待。
  * v2.12 新增：模型前缀自动修复——带 anthropic/ 前缀的模型在 new-api 的
- * OpenAI 端点会固定产生 empty_stream(无 contentBlock) 空流；发送前自动改为无前缀。
+ * OpenAI 端点会高频产生 empty_stream(无 contentBlock) 空流；发送前自动改为无前缀。
+ * v2.13 新增：请求参数清洗——实测 stop/logit_bias/presence_penalty/frequency_penalty
+ * 等附加参数会触发 new-api Claude 渠道空流；发送前移除这些参数，只保留最稳的最小集。
  * License: MIT
  */
 (function (global) {
@@ -29,7 +31,7 @@
 
     const PLUGIN_KEY = 'emptyReplyGuard';
     const PLUGIN_NAME = '空回守卫 · Empty Reply Guard';
-    const VERSION = '2.12.0';
+    const VERSION = '2.13.0';
 
     // =========================================================
     // 默认设置（会合并进 extension_settings.emptyReplyGuard）
@@ -65,7 +67,8 @@
         enableEverRetry: true,         // 永续重试：失败后后台自动重试直到成功
         everRetryMaxMinutes: 30,       // 永续重试最长持续（分钟）
         everRetryBaseSec: 45,          // 首轮等待（秒），之后递增
-        enableModelPrefixFix: true,    // 模型前缀修复：anthropic/ 前缀在 OpenAI 端点必空流 → 自动去前缀
+        enableModelPrefixFix: true,    // 模型前缀修复：anthropic/ 前缀在 OpenAI 端点易空流 → 自动去前缀
+        enableBodySanitize: true,      // 请求参数清洗：移除触发空流的高危附加参数
     };
 
     // =========================================================
@@ -546,14 +549,19 @@
             if (!bodyJson || !deps.isTarget(String(input), bodyJson)) {
                 return deps.fetchImpl(input, init);
             }
-            // v2.8.0 长输出保护：单轮 max_tokens 过大 → 发送前钳制（防止超长输出撞爆渠道超时）
-            let sendBody = bodyJson;
-            // v2.12.0 模型前缀修复：anthropic/ 前缀在 new-api OpenAI 端点必空流 → 自动去前缀
-            if (opts.modelPrefixFix && typeof sendBody.model === 'string' && /^anthropic\//i.test(sendBody.model)) {
-                const fixed = sendBody.model.replace(/^anthropic\//i, '');
-                deps.log('检测到带 anthropic/ 前缀模型，自动改为无前缀发送: ' + fixed + '（该前缀在 OpenAI 端点会固定空流）');
-                sendBody = { ...sendBody, model: fixed };
+            // v2.13.0 请求体清洗：去 anthropic/ 前缀 + 移除高危附加参数（实测触发 empty_stream）
+            let sendBody = sanitizeRequestBody(bodyJson, {
+                modelPrefixFix: !!opts.modelPrefixFix,
+                bodySanitize: !!opts.bodySanitize,
+            });
+            const prefixChanged = sendBody.model !== bodyJson.model;
+            if (prefixChanged) {
+                deps.log('检测到带 anthropic/ 前缀模型，自动改为无前缀发送: ' + sendBody.model);
             }
+            if (opts.bodySanitize && (('stop' in bodyJson) || ('logit_bias' in bodyJson) || ('presence_penalty' in bodyJson) || ('frequency_penalty' in bodyJson) || ('top_p' in bodyJson))) {
+                deps.log('已移除高危附加参数（stop/logit_bias/penalties/top_p 等），避免触发上游空流');
+            }
+            // v2.8.0 长输出保护：单轮 max_tokens 过大 → 发送前钳制（防止超长输出撞爆渠道超时）
             const maxOut = Number(opts.maxOutputTokens) || 0;
             if (maxOut > 0 && Number(bodyJson.max_tokens) > maxOut) {
                 deps.log('检测到超大单轮输出 max_tokens=' + bodyJson.max_tokens + '，发送前钳制为 ' + maxOut + '（防止长输出被渠道超时掐断，配合酒馆“自动续写”更佳）');
@@ -744,6 +752,26 @@
         return out;
     }
 
+    /** 高危附加参数（实测会触发 new-api Claude 渠道 empty_stream）。 */
+    const HIGH_RISK_PARAMS = ['stop', 'logit_bias', 'presence_penalty', 'frequency_penalty', 'top_p', 'top_k', 'seed', 'logprobs'];
+
+    /**
+     * 清洗请求体为“最稳最小集”（实测 A 组合 3/3 稳定）。
+     * 保留 model/messages/stream/max_tokens/temperature，移除高危参数。
+     */
+    function sanitizeRequestBody(body, opts) {
+        const b = { ...body };
+        if (opts && opts.modelPrefixFix && typeof b.model === 'string' && /^anthropic\//i.test(b.model)) {
+            b.model = b.model.replace(/^anthropic\//i, '');
+        }
+        if (opts && opts.bodySanitize) {
+            for (const k of HIGH_RISK_PARAMS) {
+                if (Object.prototype.hasOwnProperty.call(b, k)) delete b[k];
+            }
+        }
+        return b;
+    }
+
     /** 永续重试的间隔计算（递增，封顶 5 分钟）。 */
     function computeEverRetryDelay(baseSec, factor, attempt, capSec) {
         const raw = Math.round(baseSec * Math.pow(factor, Math.max(0, attempt - 1)));
@@ -780,6 +808,8 @@
                 parseFailoverUrls,
                 pickNextFailover,
                 computeEverRetryDelay,
+                sanitizeRequestBody,
+                HIGH_RISK_PARAMS,
             };
         }
         return;
@@ -864,6 +894,7 @@
         settings.everRetryMaxMinutes = clampInt(settings.everRetryMaxMinutes, 5, 240, DEFAULTS.everRetryMaxMinutes);
         settings.everRetryBaseSec = clampInt(settings.everRetryBaseSec, 15, 600, DEFAULTS.everRetryBaseSec);
         if (typeof settings.enableModelPrefixFix !== 'boolean') settings.enableModelPrefixFix = DEFAULTS.enableModelPrefixFix;
+        if (typeof settings.enableBodySanitize !== 'boolean') settings.enableBodySanitize = DEFAULTS.enableBodySanitize;
         if (typeof settings.failoverUrls !== 'string') settings.failoverUrls = DEFAULTS.failoverUrls;
         if (typeof settings.handleTypes !== 'string') settings.handleTypes = DEFAULTS.handleTypes;
     }
@@ -1381,7 +1412,8 @@
             '  <div class="erg-row"><span>最长持续（分钟）</span><input type="number" id="erg_ever_minutes" min="5" max="240" step="5"></div>',
             '  <div class="erg-row"><span>首轮间隔（秒）</span><input type="number" id="erg_ever_base" min="15" max="600" step="15"></div>',
             '  <h4 class="erg-sub">模型前缀修复（重要）</h4>',
-            '  <label class="checkbox_label"><input type="checkbox" id="erg_prefix_enable"> 自动去掉模型名的 anthropic/ 前缀（该前缀在 OpenAI 端点必空流）</label>',
+            '  <label class="checkbox_label"><input type="checkbox" id="erg_prefix_enable"> 自动去掉模型名的 anthropic/ 前缀（该前缀易空流）</label>',
+            '  <label class="checkbox_label"><input type="checkbox" id="erg_sanitize_enable"> 请求参数清洗：移除 stop/logit_bias/penalties 等高危参数（实测触发空流）</label>',
             '  <label class="checkbox_label"><input type="checkbox" id="erg_debug"> 调试日志（控制台）</label>',
             '  <div class="erg-stats" id="erg_stats"></div>',
             '  <div class="erg-buttons">',
@@ -1426,6 +1458,7 @@
         $('#erg_ever_minutes').val(settings.everRetryMaxMinutes);
         $('#erg_ever_base').val(settings.everRetryBaseSec);
         $('#erg_prefix_enable').prop('checked', !!settings.enableModelPrefixFix);
+        $('#erg_sanitize_enable').prop('checked', !!settings.enableBodySanitize);
         $('#erg_debug').prop('checked', !!settings.debug);
         refreshStatsUi();
     }
@@ -1565,6 +1598,10 @@
             settings.enableModelPrefixFix = $(this).prop('checked');
             saveSettings();
         });
+        $('#erg_sanitize_enable').on('change', function () {
+            settings.enableBodySanitize = $(this).prop('checked');
+            saveSettings();
+        });
         $('#erg_debug').on('change', function () {
             settings.debug = $(this).prop('checked');
             saveSettings();
@@ -1696,6 +1733,7 @@
                     delayMs: 1200,
                     maxOutputTokens: settings.enableLongOutputGuard ? settings.longOutputMaxTokens : 0,
                     modelPrefixFix: !!settings.enableModelPrefixFix,
+                    bodySanitize: !!settings.enableBodySanitize,
                 }),
                 log: (msg) => {
                     console.log('[空回守卫]', msg);
