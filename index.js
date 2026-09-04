@@ -9,6 +9,9 @@
  * v2.4 新增：非流式请求也由请求层接管（关掉流式的用户同样有“空内容自动重试”），
  * 新开空白窗口的随机空回/空流同样被兜住。
  * v2.5 新增：流式请求遇到 5xx（502/503 等渠道临时故障）也自动重试，不再直接报错。
+ * v2.6 新增：请求自动瘦身——监听酒馆 chat_completion_prompt_ready 事件，
+ * 在发送前对完整请求体（含预设/世界书/角色卡/系统提示）自动精简：
+ * 超长内容截断 + 总预算超限裁剪最旧消息。不修改任何存档。
  * License: MIT
  */
 (function (global) {
@@ -16,7 +19,7 @@
 
     const PLUGIN_KEY = 'emptyReplyGuard';
     const PLUGIN_NAME = '空回守卫 · Empty Reply Guard';
-    const VERSION = '2.5.0';
+    const VERSION = '2.6.0';
 
     // =========================================================
     // 默认设置（会合并进 extension_settings.emptyReplyGuard）
@@ -37,6 +40,9 @@
         contextThreshold: 0.80,        // 上下文占用达到该比例时触发保护（0.5-0.95）
         contextAutoTrim: true,         // 自动裁剪最旧消息（关 = 仅提醒不裁剪）
         contextMinKeep: 6,             // 裁剪时至少保留的最后消息条数（含第一条定场）
+        enableSlimPrompt: true,        // 请求自动瘦身：发送前精简超长预设/世界书内容
+        slimThreshold: 0.70,           // 请求总预算达到该比例时触发瘦身（0.5-0.95）
+        slimMaxContentChars: 4000,     // 单条内容超过该字符数则截断
     };
 
     // =========================================================
@@ -605,6 +611,48 @@
     }
 
     // =========================================================
+    // 请求自动瘦身（v2.6.0）：发送前精简完整请求体（含预设/世界书）
+    // =========================================================
+
+    /**
+     * 纯决策函数（可单测）：截断超长内容 + 超预算裁剪最旧消息。
+     * @param {array} chat 消息数组 [{role, content|mes, ...}]
+     * @param {object} opts { maxTokens, threshold, maxContentChars, estimateTokens }
+     * @returns {{chat:array, clipped:number, trimmed:number, totalTokens:number}}
+     */
+    function slimChatMessages(chat, opts) {
+        const arr = Array.isArray(chat) ? chat.map((m) => ({ ...m })) : [];
+        const { maxTokens, threshold, maxContentChars, estimateTokens } = opts;
+
+        // 1) 截断超长单条内容（保留首尾，中间省略）
+        let clipped = 0;
+        for (const m of arr) {
+            const raw = String(m.content ?? m.mes ?? '');
+            if (raw.length > maxContentChars) {
+                const headLen = Math.floor(maxContentChars * 0.55);
+                const tailLen = Math.floor(maxContentChars * 0.35);
+                const slim = raw.slice(0, headLen) + '\n…[空回守卫自动精简]…\n' + raw.slice(-tailLen);
+                m.content = slim;
+                if (m.mes !== undefined) m.mes = slim;
+                clipped++;
+            }
+        }
+
+        // 2) 总预算裁剪（从最早的非第一条消息删起，保留 messages[0]）
+        let total = arr.reduce((a, m) => a + Math.max(0, estimateTokens(String(m.content ?? m.mes ?? ''))), 0);
+        const target = Math.max(1, Math.round(maxTokens * threshold));
+        let trimmed = 0;
+        let idx = 1;
+        const hardCap = Math.max(10, arr.length);
+        while (total > Math.floor(target * 0.95) && idx < arr.length && trimmed < hardCap) {
+            total -= Math.max(0, estimateTokens(String(arr[idx].content ?? arr[idx].mes ?? '')));
+            arr.splice(idx, 1);
+            trimmed++;
+        }
+        return { chat: arr, clipped, trimmed, totalTokens: total };
+    }
+
+    // =========================================================
     // 浏览器/酒馆环境
     // =========================================================
     if (typeof global.document === 'undefined' || !global.document.documentElement) {
@@ -619,6 +667,7 @@
                 createRecoverySession,
                 createFetchGuard,
                 planContextTrim,
+                slimChatMessages,
             };
         }
         return;
@@ -632,6 +681,7 @@
         session: null,
         recentErrors: [],     // 最近错误（诊断用）
         recentEvents: [],     // 最近事件（诊断用）
+        slimHinted: false,    // 请求瘦身首次提示标记
         stats: { detected: 0, recovered: 0, failed: 0, attempts: 0 },
     };
 
@@ -686,6 +736,8 @@
         settings.fetchMaxRetries = clampInt(settings.fetchMaxRetries, 0, 5, DEFAULTS.fetchMaxRetries);
         settings.contextThreshold = clampFloat(settings.contextThreshold, 0.5, 0.95, DEFAULTS.contextThreshold);
         settings.contextMinKeep = clampInt(settings.contextMinKeep, 2, 50, DEFAULTS.contextMinKeep);
+        settings.slimThreshold = clampFloat(settings.slimThreshold, 0.5, 0.95, DEFAULTS.slimThreshold);
+        settings.slimMaxContentChars = clampInt(settings.slimMaxContentChars, 500, 20000, DEFAULTS.slimMaxContentChars);
         if (typeof settings.handleTypes !== 'string') settings.handleTypes = DEFAULTS.handleTypes;
     }
 
@@ -917,6 +969,38 @@
         setTimeout(() => { runContextGuard(); }, 400);
     }
 
+    // ---------- 请求自动瘦身（v2.6.0）----------
+    async function handlePromptReady(data) {
+        if (!settings.enabled || !settings.enableSlimPrompt || !data || !Array.isArray(data.chat) || data.dryRun) return;
+        const maxTokens = Number(ctx.maxContext || 0);
+        if (!maxTokens || data.chat.length === 0) return;
+        try {
+            // 快速字符估算判断是否超线（不逐条调 tokenizer，省性能）
+            const estByChars = (t) => Math.max(1, Math.round(String(t).length / 2));
+            const rough = data.chat.reduce((a, m) => a + estByChars(String(m.content ?? m.mes ?? '')), 0);
+            if (rough <= maxTokens * settings.slimThreshold * 1.1) return; // 明显安全则跳过
+            const result = slimChatMessages(data.chat, {
+                maxTokens,
+                threshold: settings.slimThreshold,
+                maxContentChars: settings.slimMaxContentChars,
+                estimateTokens: estByChars,
+            });
+            // 写回原数组（事件负载可能被酒馆继续引用）
+            data.chat.length = 0;
+            for (const m of result.chat) data.chat.push(m);
+            if (result.clipped || result.trimmed) {
+                recordEvent('slim-prompt', { clipped: result.clipped, trimmed: result.trimmed, total: result.totalTokens });
+                debugLog('请求瘦身: 截断 ' + result.clipped + ' 条 / 删除 ' + result.trimmed + ' 条');
+                if (!state.slimHinted) {
+                    state.slimHinted = true;
+                    notify('请求自动瘦身已生效：超长预设/世界书内容会在发送前自动精简（不修改存档）。', 'info', 8000);
+                }
+            }
+        } catch (e) {
+            debugLog('handlePromptReady failed', e);
+        }
+    }
+
     // ---------- 事件接线 ----------
     function handleMessageReceived(messageId, type) {
         if (!settings.enabled || state.busy) return;
@@ -956,6 +1040,10 @@
         on('MESSAGE_SWIPED', () => { if (!state.selfGenerating) abandon('用户切换了 swipes'); });
         on('CHAT_CHANGED', () => abandon('切换了聊天'));
         on('MESSAGE_DELETED', () => { if (!state.selfGenerating) abandon('消息被删除'); });
+        // 请求自动瘦身：在酒馆组装完发送内容之后、发出请求之前精简
+        if (et.CHAT_COMPLETION_PROMPT_READY) {
+            ctx.eventSource.on(et.CHAT_COMPLETION_PROMPT_READY, handlePromptReady);
+        }
         debugLog('events bound');
     }
 
@@ -980,6 +1068,10 @@
             '  <label class="checkbox_label"><input type="checkbox" id="erg_ctx_trim"> 超限时自动裁剪最旧消息（关=仅提醒）</label>',
             '  <div class="erg-row"><span>触发阈值（占用比例）</span><input type="number" id="erg_ctx_threshold" min="0.5" max="0.95" step="0.05"></div>',
             '  <div class="erg-row"><span>最少保留消息条数</span><input type="number" id="erg_ctx_minkeep" min="2" max="50" step="1"></div>',
+            '  <h4 class="erg-sub">请求自动瘦身（防预设/世界书过大）</h4>',
+            '  <label class="checkbox_label"><input type="checkbox" id="erg_slim_enable"> 发送前自动精简超长预设/世界书内容（不修改存档）</label>',
+            '  <div class="erg-row"><span>总预算阈值（占 max_context）</span><input type="number" id="erg_slim_threshold" min="0.5" max="0.95" step="0.05"></div>',
+            '  <div class="erg-row"><span>单条内容最大字符数</span><input type="number" id="erg_slim_chars" min="500" max="20000" step="500"></div>',
             '  <label class="checkbox_label"><input type="checkbox" id="erg_debug"> 调试日志（控制台）</label>',
             '  <div class="erg-stats" id="erg_stats"></div>',
             '  <div class="erg-buttons">',
@@ -1008,6 +1100,9 @@
         $('#erg_ctx_trim').prop('checked', !!settings.contextAutoTrim);
         $('#erg_ctx_threshold').val(settings.contextThreshold);
         $('#erg_ctx_minkeep').val(settings.contextMinKeep);
+        $('#erg_slim_enable').prop('checked', !!settings.enableSlimPrompt);
+        $('#erg_slim_threshold').val(settings.slimThreshold);
+        $('#erg_slim_chars').val(settings.slimMaxContentChars);
         $('#erg_debug').prop('checked', !!settings.debug);
         refreshStatsUi();
     }
@@ -1076,6 +1171,20 @@
         $('#erg_ctx_minkeep').on('change', function () {
             settings.contextMinKeep = clampInt($(this).val(), 2, 50, DEFAULTS.contextMinKeep);
             $(this).val(settings.contextMinKeep);
+            saveSettings();
+        });
+        $('#erg_slim_enable').on('change', function () {
+            settings.enableSlimPrompt = $(this).prop('checked');
+            saveSettings();
+        });
+        $('#erg_slim_threshold').on('change', function () {
+            settings.slimThreshold = clampFloat($(this).val(), 0.5, 0.95, DEFAULTS.slimThreshold);
+            $(this).val(settings.slimThreshold);
+            saveSettings();
+        });
+        $('#erg_slim_chars').on('change', function () {
+            settings.slimMaxContentChars = clampInt($(this).val(), 500, 20000, DEFAULTS.slimMaxContentChars);
+            $(this).val(settings.slimMaxContentChars);
             saveSettings();
         });
         $('#erg_debug').on('change', function () {
