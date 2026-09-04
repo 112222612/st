@@ -8,6 +8,7 @@
  * 常见于中转站 Claude 渠道）也纳入自动重试/非流式兜底，而不是透传报错。
  * v2.4 新增：非流式请求也由请求层接管（关掉流式的用户同样有“空内容自动重试”），
  * 新开空白窗口的随机空回/空流同样被兜住。
+ * v2.5 新增：流式请求遇到 5xx（502/503 等渠道临时故障）也自动重试，不再直接报错。
  * License: MIT
  */
 (function (global) {
@@ -15,7 +16,7 @@
 
     const PLUGIN_KEY = 'emptyReplyGuard';
     const PLUGIN_NAME = '空回守卫 · Empty Reply Guard';
-    const VERSION = '2.4.0';
+    const VERSION = '2.5.0';
 
     // =========================================================
     // 默认设置（会合并进 extension_settings.emptyReplyGuard）
@@ -327,6 +328,11 @@
                 if (!resp.ok) {
                     const errText = await resp.clone().text().catch(() => '');
                     deps.log('生成请求失败 status=' + resp.status);
+                    if (resp.status >= 500 && attempt < maxAttempts - 1) {
+                        // v2.5.0：5xx 属于渠道临时故障，自动重试而不是直接报错
+                        deps.log('5xx 错误（渠道可能临时故障），自动重试...');
+                        continue;
+                    }
                     enq(controller, enc, 'data: ' + JSON.stringify({ error: { message: '生成请求失败：' + resp.status + ' ' + String(errText).slice(0, 200) } }) + '\n\n');
                     return;
                 }
