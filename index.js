@@ -24,6 +24,8 @@
  * OpenAI 端点会高频产生 empty_stream(无 contentBlock) 空流；发送前自动改为无前缀。
  * v2.13 新增：请求参数清洗——实测 stop/logit_bias/presence_penalty/frequency_penalty
  * 等附加参数会触发 new-api Claude 渠道空流；发送前移除这些参数，只保留最稳的最小集。
+ * v2.14 新增：拦截统计战报 + 一键自检——记录每次自动修复的数量与原因，
+ * 一键生成可粘贴的 Markdown 报告；一键自检当前线路/参数组合是否健康。
  * License: MIT
  */
 (function (global) {
@@ -31,7 +33,7 @@
 
     const PLUGIN_KEY = 'emptyReplyGuard';
     const PLUGIN_NAME = '空回守卫 · Empty Reply Guard';
-    const VERSION = '2.13.0';
+    const VERSION = '2.14.0';
 
     // =========================================================
     // 默认设置（会合并进 extension_settings.emptyReplyGuard）
@@ -752,6 +754,29 @@
         return out;
     }
 
+    /** 生成可粘贴的 Markdown 战报（纯函数，可单测）。 */
+    function buildReportText(payload) {
+        const c = payload.counters || {};
+        const lines = [];
+        lines.push('## 空回守卫 · Empty Reply Guard 战报');
+        lines.push('');
+        lines.push('- 插件版本：' + (payload.version || '?'));
+        lines.push('- 生成时间：' + (payload.generatedAt || ''));
+        lines.push('- 拦截修复统计（启动至今）：');
+        lines.push('  - 空流/空流类错误自动重试：' + (c.emptyStreamIntercepted || 0) + ' 次');
+        lines.push('  - 模型前缀自动修复：' + (c.prefixFixed || 0) + ' 次');
+        lines.push('  - 高危参数清洗：' + (c.paramsSanitized || 0) + ' 次');
+        lines.push('  - 5xx 自动重试：' + (c.retry5xx || 0) + ' 次');
+        lines.push('  - 长输出钳制：' + (c.longOutputClamped || 0) + ' 次');
+        lines.push('  - 请求瘦身：' + (c.slimmed || 0) + ' 次');
+        lines.push('  - 自动换路：' + (c.failoverSwitched || 0) + ' 次');
+        lines.push('  - 永续重试补回复：' + (c.everRetryRecovered || 0) + ' 次');
+        lines.push('  - 自动修复成功：' + (c.autoRecovered || 0) + ' 次');
+        lines.push('- 空回命中：' + (payload.stats ? payload.stats.detected : 0) + ' 次，最终失败：' + (payload.stats ? payload.stats.failed : 0) + ' 次');
+        lines.push('- 当前设置：流式=' + (payload.api && payload.api.streaming) + '，阈值/清洗/换路/永续重试均默认开启');
+        return lines.join('\n');
+    }
+
     /** 高危附加参数（实测会触发 new-api Claude 渠道 empty_stream）。 */
     const HIGH_RISK_PARAMS = ['stop', 'logit_bias', 'presence_penalty', 'frequency_penalty', 'top_p', 'top_k', 'seed', 'logprobs'];
 
@@ -810,6 +835,7 @@
                 computeEverRetryDelay,
                 sanitizeRequestBody,
                 HIGH_RISK_PARAMS,
+                buildReportText,
             };
         }
         return;
@@ -831,6 +857,7 @@
         everRetryTimer: null, // 永续重试定时器
         everRetryLoopId: 0,   // 循环代次（防并发）
         stats: { detected: 0, recovered: 0, failed: 0, attempts: 0 },
+        counters: {},              // 分类拦截统计（战报用）
     };
 
     let settings = { ...DEFAULTS };
@@ -848,8 +875,30 @@
 
     function recordEvent(name, extra) {
         state.recentEvents.push({ at: new Date().toISOString(), name, ...(extra || {}) });
-        if (state.recentEvents.length > 40) state.recentEvents.shift();
+        if (state.recentEvents.length > 60) state.recentEvents.shift();
         debugLog('event:', name, extra || '');
+        // 分类计数（战报统计用）
+        const msg = extra && extra.msg ? String(extra.msg) : '';
+        if (name === 'fetch-guard') {
+            if (/空流/.test(msg)) bumpCounter('emptyStreamIntercepted');
+            if (/前缀/.test(msg)) bumpCounter('prefixFixed');
+            if (/高危附加参数/.test(msg)) bumpCounter('paramsSanitized');
+            if (/5xx/.test(msg)) bumpCounter('retry5xx');
+            if (/钳制/.test(msg)) bumpCounter('longOutputClamped');
+        } else if (name === 'slim-prompt') {
+            bumpCounter('slimmed');
+        } else if (name === 'failover') {
+            bumpCounter('failoverSwitched');
+        } else if (name === 'ever-retry-recovered') {
+            bumpCounter('everRetryRecovered');
+        } else if (name === 'recovered' || name === 'recovered-externally') {
+            bumpCounter('autoRecovered');
+        }
+    }
+
+    function bumpCounter(key) {
+        if (!state || !state.counters) return;
+        state.counters[key] = (state.counters[key] || 0) + 1;
     }
 
     function notify(text, type = 'info', timeout = 6000) {
@@ -1419,6 +1468,8 @@
             '  <div class="erg-buttons">',
             '    <button id="erg_retry_now">立即重试上一条</button>',
             '    <button id="erg_copy_diag">复制诊断信息</button>',
+            '    <button id="erg_copy_report">复制战报（带统计）</button>',
+            '    <button id="erg_selftest">一键自检</button>',
             '    <button id="erg_reset_stats">清零统计</button>',
             '  </div>',
 
@@ -1617,6 +1668,11 @@
             startRecoverySession();
         });
         $('#erg_copy_diag').on('click', copyDiagnostics);
+        $('#erg_copy_report').on('click', copyReport);
+        $('#erg_selftest').on('click', function () {
+            if (state.busy) { notify('正在自动重试中，请稍候…', 'warning'); return; }
+            runSelfTest();
+        });
         $('#erg_reset_stats').on('click', function () {
             state.stats = { detected: 0, recovered: 0, failed: 0, attempts: 0 };
             state.recentErrors = [];
@@ -1649,9 +1705,10 @@
                 url: cc ? (cc.custom_url || cc.reverse_proxy || null) : null,
             },
             recentErrors: state.recentErrors.slice(-10),
-            recentEvents: state.recentEvents.slice(-40),
+            recentEvents: state.recentEvents.slice(-60),
             chatTail,
             hints: buildHints(),
+            summary: { ...state.counters },
         };
     }
 
@@ -1688,6 +1745,56 @@
             }
         } catch (e) {
             notify('复制失败：' + friendlyError(e), 'error');
+        }
+    }
+
+    // ---------- 一键自检（v2.14.0）----------
+    async function runSelfTest() {
+        try {
+            if (!ctx || typeof ctx.sendGenerationRequest !== 'function') {
+                notify('自检失败：当前版本未暴露 sendGenerationRequest', 'error');
+                return null;
+            }
+            notify('正在自检（走真实链路，约 10~30 秒）…', 'info', 8000);
+            const t0 = Date.now();
+            const data = await ctx.sendGenerationRequest('quiet', {
+                prompt: [{ role: 'user', content: 'ping' }],
+            }, {});
+            const ms = Date.now() - t0;
+            const text = data?.choices?.[0]?.message?.content || '';
+            if (typeof text === 'string' && text.trim().length > 0) {
+                notify('✓ 自检通过：当前线路与参数组合健康（' + ms + 'ms）', 'success', 8000);
+                recordEvent('self-test-ok', { ms });
+            } else {
+                notify('自检未通过：链路通了但上游返回空内容（' + ms + 'ms）', 'warning', 10000);
+                recordEvent('self-test-empty', { ms });
+            }
+            return { ok: text.trim().length > 0, ms, text: String(text).slice(0, 80) };
+        } catch (e) {
+            notify('自检失败：' + friendlyError(e), 'error', 10000);
+            recordEvent('self-test-fail', { err: friendlyError(e) });
+            return { ok: false, ms: 0, error: friendlyError(e) };
+        }
+    }
+
+    function copyReport() {
+        const payload = {
+            version: VERSION,
+            generatedAt: new Date().toISOString(),
+            counters: { ...state.counters },
+            stats: { ...state.stats },
+            api: {
+                mainApi: ctx ? ctx.mainApi : null,
+                streaming: ctx && ctx.chatCompletionSettings ? ctx.chatCompletionSettings.stream_openai : null,
+                url: (ctx && ctx.chatCompletionSettings && (ctx.chatCompletionSettings.custom_url || ctx.chatCompletionSettings.reverse_proxy)) || null,
+            },
+        };
+        const md = buildReportText(payload);
+        const done = () => notify('战报已复制 ✔ 可直接粘贴到群里', 'success', 6000);
+        if (global.navigator && typeof navigator.clipboard.writeText === 'function') {
+            navigator.clipboard.writeText(md).then(done, () => legacyCopy(md, done));
+        } else {
+            legacyCopy(md, done);
         }
     }
 
