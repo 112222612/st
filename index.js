@@ -20,6 +20,8 @@
  * 切到备用地址（默认 .online <-> .xyz 互换），全程静默，无需任何手动操作。
  * v2.11 新增：永续重试——修复失败后进入后台自动重试（间隔递增，最长 30 分钟），
  * 线路一恢复自动把回复补进聊天，用户无需盯屏等待。
+ * v2.12 新增：模型前缀自动修复——带 anthropic/ 前缀的模型在 new-api 的
+ * OpenAI 端点会固定产生 empty_stream(无 contentBlock) 空流；发送前自动改为无前缀。
  * License: MIT
  */
 (function (global) {
@@ -27,7 +29,7 @@
 
     const PLUGIN_KEY = 'emptyReplyGuard';
     const PLUGIN_NAME = '空回守卫 · Empty Reply Guard';
-    const VERSION = '2.11.0';
+    const VERSION = '2.12.0';
 
     // =========================================================
     // 默认设置（会合并进 extension_settings.emptyReplyGuard）
@@ -63,6 +65,7 @@
         enableEverRetry: true,         // 永续重试：失败后后台自动重试直到成功
         everRetryMaxMinutes: 30,       // 永续重试最长持续（分钟）
         everRetryBaseSec: 45,          // 首轮等待（秒），之后递增
+        enableModelPrefixFix: true,    // 模型前缀修复：anthropic/ 前缀在 OpenAI 端点必空流 → 自动去前缀
     };
 
     // =========================================================
@@ -545,10 +548,16 @@
             }
             // v2.8.0 长输出保护：单轮 max_tokens 过大 → 发送前钳制（防止超长输出撞爆渠道超时）
             let sendBody = bodyJson;
+            // v2.12.0 模型前缀修复：anthropic/ 前缀在 new-api OpenAI 端点必空流 → 自动去前缀
+            if (opts.modelPrefixFix && typeof sendBody.model === 'string' && /^anthropic\//i.test(sendBody.model)) {
+                const fixed = sendBody.model.replace(/^anthropic\//i, '');
+                deps.log('检测到带 anthropic/ 前缀模型，自动改为无前缀发送: ' + fixed + '（该前缀在 OpenAI 端点会固定空流）');
+                sendBody = { ...sendBody, model: fixed };
+            }
             const maxOut = Number(opts.maxOutputTokens) || 0;
             if (maxOut > 0 && Number(bodyJson.max_tokens) > maxOut) {
                 deps.log('检测到超大单轮输出 max_tokens=' + bodyJson.max_tokens + '，发送前钳制为 ' + maxOut + '（防止长输出被渠道超时掐断，配合酒馆“自动续写”更佳）');
-                sendBody = { ...bodyJson, max_tokens: maxOut };
+                sendBody = { ...sendBody, max_tokens: maxOut };
             }
             deps.log('拦截生成请求（请求层修复）：model=' + (sendBody.model || '(未指定)') + (Array.isArray(sendBody.tools) && sendBody.tools.length ? '（带 tools）' : ''));
             if (bodyJson.stream) {
@@ -854,6 +863,7 @@
         settings.failoverCooldownSec = clampInt(settings.failoverCooldownSec, 60, 3600, DEFAULTS.failoverCooldownSec);
         settings.everRetryMaxMinutes = clampInt(settings.everRetryMaxMinutes, 5, 240, DEFAULTS.everRetryMaxMinutes);
         settings.everRetryBaseSec = clampInt(settings.everRetryBaseSec, 15, 600, DEFAULTS.everRetryBaseSec);
+        if (typeof settings.enableModelPrefixFix !== 'boolean') settings.enableModelPrefixFix = DEFAULTS.enableModelPrefixFix;
         if (typeof settings.failoverUrls !== 'string') settings.failoverUrls = DEFAULTS.failoverUrls;
         if (typeof settings.handleTypes !== 'string') settings.handleTypes = DEFAULTS.handleTypes;
     }
@@ -1370,6 +1380,8 @@
             '  <label class="checkbox_label"><input type="checkbox" id="erg_ever_enable"> 失败后后台自动重试，直到把回复补出来</label>',
             '  <div class="erg-row"><span>最长持续（分钟）</span><input type="number" id="erg_ever_minutes" min="5" max="240" step="5"></div>',
             '  <div class="erg-row"><span>首轮间隔（秒）</span><input type="number" id="erg_ever_base" min="15" max="600" step="15"></div>',
+            '  <h4 class="erg-sub">模型前缀修复（重要）</h4>',
+            '  <label class="checkbox_label"><input type="checkbox" id="erg_prefix_enable"> 自动去掉模型名的 anthropic/ 前缀（该前缀在 OpenAI 端点必空流）</label>',
             '  <label class="checkbox_label"><input type="checkbox" id="erg_debug"> 调试日志（控制台）</label>',
             '  <div class="erg-stats" id="erg_stats"></div>',
             '  <div class="erg-buttons">',
@@ -1413,6 +1425,7 @@
         $('#erg_ever_enable').prop('checked', !!settings.enableEverRetry);
         $('#erg_ever_minutes').val(settings.everRetryMaxMinutes);
         $('#erg_ever_base').val(settings.everRetryBaseSec);
+        $('#erg_prefix_enable').prop('checked', !!settings.enableModelPrefixFix);
         $('#erg_debug').prop('checked', !!settings.debug);
         refreshStatsUi();
     }
@@ -1548,6 +1561,10 @@
             $(this).val(settings.everRetryBaseSec);
             saveSettings();
         });
+        $('#erg_prefix_enable').on('change', function () {
+            settings.enableModelPrefixFix = $(this).prop('checked');
+            saveSettings();
+        });
         $('#erg_debug').on('change', function () {
             settings.debug = $(this).prop('checked');
             saveSettings();
@@ -1678,6 +1695,7 @@
                     fallbackNonStream: !!settings.fetchFallbackNonStream,
                     delayMs: 1200,
                     maxOutputTokens: settings.enableLongOutputGuard ? settings.longOutputMaxTokens : 0,
+                    modelPrefixFix: !!settings.enableModelPrefixFix,
                 }),
                 log: (msg) => {
                     console.log('[空回守卫]', msg);
