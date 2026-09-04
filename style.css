@@ -9,6 +9,11 @@
     margin: 0 0 2px;
     font-size: 1.05em;
 }
+.empty-reply-guard-settings h4.erg-sub {
+    margin-top: 8px;
+    padding-top: 6px;
+    border-top: 1px solid var(--black30, rgba(0,0,0,0.3));
+}
 .empty-reply-guard-settings h4 small {
     opacity: 0.65;
     font-weight: normal;

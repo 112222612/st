@@ -1,5 +1,5 @@
 /*!
- * 空回守卫 Empty Reply Guard v2.2.0
+ * 空回守卫 Empty Reply Guard v2.3.0
  * 自动检测并修复酒馆(SillyTavern)的“空回复”（仅供私人使用）。
  * v2.0 新增“请求层修复”：包装 window.fetch，在生成请求到达酒馆解析器之前
  * 就完成 空流自动重试 → 非流式兜底 → 格式修复 → 工具调用提示，
@@ -13,7 +13,7 @@
 
     const PLUGIN_KEY = 'emptyReplyGuard';
     const PLUGIN_NAME = '空回守卫 · Empty Reply Guard';
-    const VERSION = '2.2.0';
+    const VERSION = '2.3.0';
 
     // =========================================================
     // 默认设置（会合并进 extension_settings.emptyReplyGuard）
@@ -30,6 +30,10 @@
         enableFetchGuard: true,        // 请求层修复：拦截生成请求，第一次就不空
         fetchMaxRetries: 2,            // 请求层空流自动重试次数（0-5）
         fetchFallbackNonStream: true,  // 请求层重试仍空 → 用非流式兜底
+        enableContextGuard: true,      // 上下文护栏：防止 token 爆掉导致空回
+        contextThreshold: 0.80,        // 上下文占用达到该比例时触发保护（0.5-0.95）
+        contextAutoTrim: true,         // 自动裁剪最旧消息（关 = 仅提醒不裁剪）
+        contextMinKeep: 6,             // 裁剪时至少保留的最后消息条数（含第一条定场）
     };
 
     // =========================================================
@@ -476,6 +480,63 @@
     }
 
     // =========================================================
+    // 上下文护栏（v2.3.0）：防止 token 超限导致空回
+    // =========================================================
+
+    /**
+     * 计算“需要裁剪哪些消息”的纯决策函数（可单测）。
+     * @param {array} chat 消息数组 [{is_user,is_system,mes,...}]
+     * @param {object} opts { maxTokens, threshold, minKeep, estimateTokens: (text)=>number }
+     * @returns {{totalTokens:number, targetTokens:number, remove:number[], safe:boolean}}
+     */
+    function planContextTrim(chat, opts) {
+        const msgs = Array.isArray(chat) ? chat : [];
+        const { maxTokens, threshold, minKeep, estimateTokens } = opts;
+        const N = msgs.length;
+        if (!maxTokens || maxTokens <= 0 || !N) return { totalTokens: 0, targetTokens: 0, remove: [], safe: true };
+
+        // 逐条估算 token（estimateTokens 注入，浏览器里用真 tokenizer，测试用近似）
+        const perTok = msgs.map((m) => Math.max(0, estimateTokens(String((m && m.mes) || ''))));
+        const totalTokens = perTok.reduce((a, b) => a + b, 0);
+        const targetTokens = Math.max(1, Math.round(maxTokens * threshold));
+
+        // 需要删掉的 token 量（留一点余量：多删 5% 避免二次触发）
+        const needRemove = Math.max(0, totalTokens - Math.floor(targetTokens * 0.95));
+        if (needRemove === 0) return { totalTokens, targetTokens, remove: [], safe: true };
+
+        // 可删范围（第一轮）：保留第一条（定场）和最后 minKeep 条
+        const keepTail = Math.max(2, minKeep);
+        const removableLo = 1;                       // 永远保留 msgs[0]
+        let toRemove = 0;
+        const remove = [];
+        const consider = (list) => {
+            for (const i of list) {
+                if (toRemove >= needRemove) break;
+                if (remove.includes(i)) continue;
+                remove.push(i);
+                toRemove += perTok[i];
+            }
+        };
+        const firstRound = [];
+        for (let i = removableLo; i <= Math.min(N - keepTail - 1, N - 2); i++) firstRound.push(i);
+        consider(firstRound);
+        if (toRemove < needRemove) {
+            // 第二轮：放宽保护区（只保留第一条 + 末尾 2 条）
+            const secondRound = [];
+            for (let i = removableLo; i <= N - 3; i++) secondRound.push(i);
+            consider(secondRound);
+        }
+        if (toRemove < needRemove) {
+            // 第三轮：保底（只保留第一条 + 末尾 1 条）
+            const thirdRound = [];
+            for (let i = removableLo; i <= N - 2; i++) thirdRound.push(i);
+            consider(thirdRound);
+        }
+        remove.sort((a, b) => a - b);
+        return { totalTokens, targetTokens, remove, safe: toRemove >= needRemove };
+    }
+
+    // =========================================================
     // 浏览器/酒馆环境
     // =========================================================
     if (typeof global.document === 'undefined' || !global.document.documentElement) {
@@ -489,6 +550,7 @@
                 friendlyError,
                 createRecoverySession,
                 createFetchGuard,
+                planContextTrim,
             };
         }
         return;
@@ -554,6 +616,8 @@
         settings.retryDelayMs = clampInt(settings.retryDelayMs, 500, 30000, DEFAULTS.retryDelayMs);
         settings.backoffFactor = clampFloat(settings.backoffFactor, 1, 3, DEFAULTS.backoffFactor);
         settings.fetchMaxRetries = clampInt(settings.fetchMaxRetries, 0, 5, DEFAULTS.fetchMaxRetries);
+        settings.contextThreshold = clampFloat(settings.contextThreshold, 0.5, 0.95, DEFAULTS.contextThreshold);
+        settings.contextMinKeep = clampInt(settings.contextMinKeep, 2, 50, DEFAULTS.contextMinKeep);
         if (typeof settings.handleTypes !== 'string') settings.handleTypes = DEFAULTS.handleTypes;
     }
 
@@ -706,6 +770,85 @@
         }
     }
 
+    // ---------- 上下文护栏（v2.3.0）----------
+    function estimateTokenByChars(text) {
+        // 无 tokenizer 可用时的字符近似（足够做护栏判断）
+        return Math.max(1, Math.round(String(text).length / 2));
+    }
+
+    async function estimateChatTokensTotal(chat) {
+        const text = chat.map((m) => String((m && m.mes) || '')).join('\n');
+        try {
+            if (typeof ctx.getTokenCountAsync === 'function') {
+                return await ctx.getTokenCountAsync(text, 0);
+            }
+            if (typeof ctx.getTokenCount === 'function') {
+                return await ctx.getTokenCount(text, 0);
+            }
+        } catch (_) { /* fallthrough */ }
+        return Math.round(text.length / 2);
+    }
+
+    async function runContextGuard() {
+        try {
+            if (!settings.enabled || !settings.enableContextGuard || !ctx || !Array.isArray(ctx.chat)) return;
+            const chat = ctx.chat;
+            const maxTokens = Number(ctx.maxContext || 0);
+            if (!maxTokens || chat.length < 3) return;
+
+            let total = 0;
+            try {
+                total = await estimateChatTokensTotal(chat);
+            } catch (_) {
+                total = chat.reduce((a, m) => a + estimateTokenByChars(String((m && m.mes) || '')), 0);
+            }
+
+            const plan = planContextTrim(chat, {
+                maxTokens,
+                threshold: settings.contextThreshold,
+                minKeep: settings.contextMinKeep,
+                estimateTokens: estimateTokenByChars,
+            });
+            const pct = Math.round((total / maxTokens) * 100);
+            if (plan.safe) {
+                debugLog('上下文占用安全: ' + pct + '%');
+                return;
+            }
+            if (plan.remove.length === 0) {
+                // 删无可删（比如消息太少）仍超限 → 只能提醒
+                notify('上下文已达 ' + pct + '%（上限约 ' + maxTokens + ' tokens），但消息太少无法自动裁剪，建议精简世界书或清理聊天。', 'warning', 10000);
+                recordEvent('context-warn', { pct, unableToTrim: true });
+                return;
+            }
+
+            if (!settings.contextAutoTrim) {
+                notify('上下文已达 ' + pct + '%（上限约 ' + maxTokens + ' tokens）。接近满分容易导致 token 超限空回，建议清理旧消息或开“自动裁剪”。', 'warning', 10000);
+                recordEvent('context-warn', { pct });
+                return;
+            }
+
+            // 从后往前删除（保持索引有效）
+            const removeSorted = [...plan.remove].sort((a, b) => b - a);
+            for (const idx of removeSorted) {
+                if (idx > 0 && idx < chat.length) chat.splice(idx, 1);
+            }
+            if (removeSorted.length && typeof ctx.saveChat === 'function') {
+                try { ctx.saveChat(); } catch (_) { /* ignore */ }
+            }
+            notify('上下文已达 ' + pct + '%，已自动裁剪最旧消息 ' + removeSorted.length + ' 条（防止 token 超限空回）。', 'warning', 8000);
+            recordEvent('context-trim', { pct, removed: removeSorted.length });
+            debugLog('context trim removed:', removeSorted.length);
+        } catch (e) {
+            debugLog('runContextGuard failed', e);
+        }
+    }
+
+    function scheduleContextGuard() {
+        if (!settings.enabled || !settings.enableContextGuard) return;
+        // 消息入列后再算（延迟一点让聊天数组更新完成）
+        setTimeout(() => { runContextGuard(); }, 400);
+    }
+
     // ---------- 事件接线 ----------
     function handleMessageReceived(messageId, type) {
         if (!settings.enabled || state.busy) return;
@@ -741,7 +884,7 @@
         on('MESSAGE_RECEIVED', handleMessageReceived);
         // 用户主动中止/切换 → 停止重试
         on('GENERATION_STOPPED', () => { if (!state.selfGenerating) abandon('用户停止了生成'); });
-        on('MESSAGE_SENT', () => abandon('用户发送了新消息'));
+        on('MESSAGE_SENT', () => { abandon('用户发送了新消息'); scheduleContextGuard(); });
         on('MESSAGE_SWIPED', () => { if (!state.selfGenerating) abandon('用户切换了 swipes'); });
         on('CHAT_CHANGED', () => abandon('切换了聊天'));
         on('MESSAGE_DELETED', () => { if (!state.selfGenerating) abandon('消息被删除'); });
@@ -764,6 +907,11 @@
             '  <label class="checkbox_label"><input type="checkbox" id="erg_fetch_fallback"> 请求层非流式兜底</label>',
             '  <label class="checkbox_label"><input type="checkbox" id="erg_placeholder"> 把「...」占位消息视为空回复</label>',
             '  <div class="erg-row"><span>处理的生成类型</span><input type="text" id="erg_handle_types" placeholder="normal, regenerate"></div>',
+            '  <h4 class="erg-sub">上下文护栏（防 token 爆掉）</h4>',
+            '  <label class="checkbox_label"><input type="checkbox" id="erg_ctx_enable"> 发送前检测上下文占用，防止 token 超限空回</label>',
+            '  <label class="checkbox_label"><input type="checkbox" id="erg_ctx_trim"> 超限时自动裁剪最旧消息（关=仅提醒）</label>',
+            '  <div class="erg-row"><span>触发阈值（占用比例）</span><input type="number" id="erg_ctx_threshold" min="0.5" max="0.95" step="0.05"></div>',
+            '  <div class="erg-row"><span>最少保留消息条数</span><input type="number" id="erg_ctx_minkeep" min="2" max="50" step="1"></div>',
             '  <label class="checkbox_label"><input type="checkbox" id="erg_debug"> 调试日志（控制台）</label>',
             '  <div class="erg-stats" id="erg_stats"></div>',
             '  <div class="erg-buttons">',
@@ -788,6 +936,10 @@
         $('#erg_fetch_fallback').prop('checked', !!settings.fetchFallbackNonStream);
         $('#erg_placeholder').prop('checked', !!settings.treatPlaceholderAsEmpty);
         $('#erg_handle_types').val(settings.handleTypes);
+        $('#erg_ctx_enable').prop('checked', !!settings.enableContextGuard);
+        $('#erg_ctx_trim').prop('checked', !!settings.contextAutoTrim);
+        $('#erg_ctx_threshold').val(settings.contextThreshold);
+        $('#erg_ctx_minkeep').val(settings.contextMinKeep);
         $('#erg_debug').prop('checked', !!settings.debug);
         refreshStatsUi();
     }
@@ -838,6 +990,24 @@
         });
         $('#erg_handle_types').on('change', function () {
             settings.handleTypes = String($(this).val() || '').trim() || DEFAULTS.handleTypes;
+            saveSettings();
+        });
+        $('#erg_ctx_enable').on('change', function () {
+            settings.enableContextGuard = $(this).prop('checked');
+            saveSettings();
+        });
+        $('#erg_ctx_trim').on('change', function () {
+            settings.contextAutoTrim = $(this).prop('checked');
+            saveSettings();
+        });
+        $('#erg_ctx_threshold').on('change', function () {
+            settings.contextThreshold = clampFloat($(this).val(), 0.5, 0.95, DEFAULTS.contextThreshold);
+            $(this).val(settings.contextThreshold);
+            saveSettings();
+        });
+        $('#erg_ctx_minkeep').on('change', function () {
+            settings.contextMinKeep = clampInt($(this).val(), 2, 50, DEFAULTS.contextMinKeep);
+            $(this).val(settings.contextMinKeep);
             saveSettings();
         });
         $('#erg_debug').on('change', function () {
