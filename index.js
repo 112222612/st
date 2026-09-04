@@ -14,6 +14,8 @@
  * 超长内容截断 + 总预算超限裁剪最旧消息。不修改任何存档。
  * v2.7 新增：深瘦身——截断后仍超预算时，用当前模型（走酒馆自己的 key）
  * 把最长的预设/世界书条目做成要点摘要替换，几千 token 压到几百。
+ * v2.8 新增：长输出保护——单轮 max_tokens 设置过大时在发送前钳制到安全值，
+ * 避免超长输出把渠道/网关超时全部撞爆（配合酒馆“自动续写”使用更佳）。
  * License: MIT
  */
 (function (global) {
@@ -21,7 +23,7 @@
 
     const PLUGIN_KEY = 'emptyReplyGuard';
     const PLUGIN_NAME = '空回守卫 · Empty Reply Guard';
-    const VERSION = '2.7.0';
+    const VERSION = '2.8.0';
 
     // =========================================================
     // 默认设置（会合并进 extension_settings.emptyReplyGuard）
@@ -48,6 +50,8 @@
         enableDeepSlim: true,          // 深瘦身：截断后仍超预算 → 用模型把最长条目压缩成摘要
         slimSummaryTargetChars: 1200,  // 摘要目标字符数
         slimSummaryMaxItems: 2,        // 每轮最多摘要的条目数
+        enableLongOutputGuard: true,   // 长输出保护：单轮 max_tokens 过大时钳制
+        longOutputMaxTokens: 8192,     // 单轮输出上限（超过则发送前钳制；配合自动续写）
     };
 
     // =========================================================
@@ -528,14 +532,21 @@
             if (!bodyJson || !deps.isTarget(String(input), bodyJson)) {
                 return deps.fetchImpl(input, init);
             }
-            deps.log('拦截生成请求（请求层修复）：model=' + (bodyJson.model || '(未指定)') + (Array.isArray(bodyJson.tools) && bodyJson.tools.length ? '（带 tools）' : ''));
+            // v2.8.0 长输出保护：单轮 max_tokens 过大 → 发送前钳制（防止超长输出撞爆渠道超时）
+            let sendBody = bodyJson;
+            const maxOut = Number(opts.maxOutputTokens) || 0;
+            if (maxOut > 0 && Number(bodyJson.max_tokens) > maxOut) {
+                deps.log('检测到超大单轮输出 max_tokens=' + bodyJson.max_tokens + '，发送前钳制为 ' + maxOut + '（防止长输出被渠道超时掐断，配合酒馆“自动续写”更佳）');
+                sendBody = { ...bodyJson, max_tokens: maxOut };
+            }
+            deps.log('拦截生成请求（请求层修复）：model=' + (sendBody.model || '(未指定)') + (Array.isArray(sendBody.tools) && sendBody.tools.length ? '（带 tools）' : ''));
             if (bodyJson.stream) {
                 // 流式请求：缓冲+空流重试+非流式兜底，输出标准 SSE
                 const enc = new TextEncoder();
                 const out = new ReadableStream({
                     async start(controller) {
                         try {
-                            await handleStreaming(controller, enc, input, init, bodyJson, opts);
+                            await handleStreaming(controller, enc, input, init, sendBody, opts);
                         } catch (e) {
                             enq(controller, enc, 'data: ' + JSON.stringify({ error: { message: '空回守卫请求层错误: ' + ((e && e.message) || e) } }) + '\n\n');
                         } finally {
@@ -550,7 +561,7 @@
                 });
             }
             // 非流式请求：空内容自动重试，仍按 JSON 返回
-            const result = await guardPlain(input, init, bodyJson, opts);
+            const result = await guardPlain(input, init, sendBody, opts);
             return new Response(JSON.stringify(result.json), {
                 status: result.status,
                 headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
@@ -786,6 +797,7 @@
         settings.slimMaxContentChars = clampInt(settings.slimMaxContentChars, 500, 20000, DEFAULTS.slimMaxContentChars);
         settings.slimSummaryTargetChars = clampInt(settings.slimSummaryTargetChars, 200, 8000, DEFAULTS.slimSummaryTargetChars);
         settings.slimSummaryMaxItems = clampInt(settings.slimSummaryMaxItems, 1, 5, DEFAULTS.slimSummaryMaxItems);
+        settings.longOutputMaxTokens = clampInt(settings.longOutputMaxTokens, 1024, 65536, DEFAULTS.longOutputMaxTokens);
         if (typeof settings.handleTypes !== 'string') settings.handleTypes = DEFAULTS.handleTypes;
     }
 
@@ -1161,6 +1173,9 @@
             '  <label class="checkbox_label"><input type="checkbox" id="erg_deepslim_enable"> 深瘦身：仍超预算时用模型压缩成摘要（用你自己的 key）</label>',
             '  <div class="erg-row"><span>摘要目标字符数</span><input type="number" id="erg_deepslim_chars" min="200" max="8000" step="100"></div>',
             '  <div class="erg-row"><span>每轮最多摘要条数</span><input type="number" id="erg_deepslim_items" min="1" max="5" step="1"></div>',
+            '  <h4 class="erg-sub">长输出保护（防单轮拉满被掐断）</h4>',
+            '  <label class="checkbox_label"><input type="checkbox" id="erg_long_enable"> 单轮 max_tokens 过大时发送前钳制</label>',
+            '  <div class="erg-row"><span>单轮输出上限 tokens</span><input type="number" id="erg_long_max" min="1024" max="65536" step="1024"></div>',
             '  <label class="checkbox_label"><input type="checkbox" id="erg_debug"> 调试日志（控制台）</label>',
             '  <div class="erg-stats" id="erg_stats"></div>',
             '  <div class="erg-buttons">',
@@ -1195,6 +1210,8 @@
         $('#erg_deepslim_enable').prop('checked', !!settings.enableDeepSlim);
         $('#erg_deepslim_chars').val(settings.slimSummaryTargetChars);
         $('#erg_deepslim_items').val(settings.slimSummaryMaxItems);
+        $('#erg_long_enable').prop('checked', !!settings.enableLongOutputGuard);
+        $('#erg_long_max').val(settings.longOutputMaxTokens);
         $('#erg_debug').prop('checked', !!settings.debug);
         refreshStatsUi();
     }
@@ -1291,6 +1308,15 @@
         $('#erg_deepslim_items').on('change', function () {
             settings.slimSummaryMaxItems = clampInt($(this).val(), 1, 5, DEFAULTS.slimSummaryMaxItems);
             $(this).val(settings.slimSummaryMaxItems);
+            saveSettings();
+        });
+        $('#erg_long_enable').on('change', function () {
+            settings.enableLongOutputGuard = $(this).prop('checked');
+            saveSettings();
+        });
+        $('#erg_long_max').on('change', function () {
+            settings.longOutputMaxTokens = clampInt($(this).val(), 1024, 65536, DEFAULTS.longOutputMaxTokens);
+            $(this).val(settings.longOutputMaxTokens);
             saveSettings();
         });
         $('#erg_debug').on('change', function () {
@@ -1421,6 +1447,7 @@
                     maxRetries: settings.fetchMaxRetries,
                     fallbackNonStream: !!settings.fetchFallbackNonStream,
                     delayMs: 1200,
+                    maxOutputTokens: settings.enableLongOutputGuard ? settings.longOutputMaxTokens : 0,
                 }),
                 log: (msg) => { console.log('[空回守卫]', msg); recordEvent('fetch-guard', { msg }); },
                 isTarget: isTargetFetch,
