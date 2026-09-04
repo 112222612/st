@@ -18,6 +18,8 @@
  * 避免超长输出把渠道/网关超时全部撞爆（配合酒馆“自动续写”使用更佳）。
  * v2.10 新增：自动换路——连续失败（空回/5xx/边缘线路问题）时自动把 API 地址
  * 切到备用地址（默认 .online <-> .xyz 互换），全程静默，无需任何手动操作。
+ * v2.11 新增：永续重试——修复失败后进入后台自动重试（间隔递增，最长 30 分钟），
+ * 线路一恢复自动把回复补进聊天，用户无需盯屏等待。
  * License: MIT
  */
 (function (global) {
@@ -25,7 +27,7 @@
 
     const PLUGIN_KEY = 'emptyReplyGuard';
     const PLUGIN_NAME = '空回守卫 · Empty Reply Guard';
-    const VERSION = '2.10.0';
+    const VERSION = '2.11.0';
 
     // =========================================================
     // 默认设置（会合并进 extension_settings.emptyReplyGuard）
@@ -58,6 +60,9 @@
         failoverUrls: 'https://emtf.aipm9527.online/v1, https://emtf.aipm9527.xyz/v1', // 备用地址（逗号分隔，可改成自己的站）
         failoverThreshold: 3,          // 连续失败 N 次触发换路
         failoverCooldownSec: 300,      // 同一地址切换冷却（秒）
+        enableEverRetry: true,         // 永续重试：失败后后台自动重试直到成功
+        everRetryMaxMinutes: 30,       // 永续重试最长持续（分钟）
+        everRetryBaseSec: 45,          // 首轮等待（秒），之后递增
     };
 
     // =========================================================
@@ -730,6 +735,12 @@
         return out;
     }
 
+    /** 永续重试的间隔计算（递增，封顶 5 分钟）。 */
+    function computeEverRetryDelay(baseSec, factor, attempt, capSec) {
+        const raw = Math.round(baseSec * Math.pow(factor, Math.max(0, attempt - 1)));
+        return Math.min(capSec || 300, Math.max(5, raw));
+    }
+
     /** 选出下一个要尝试的候选地址（排除当前地址和最近已试过的地址）。 */
     function pickNextFailover(currentUrl, allUrls, excludeSet) {
         for (const u of allUrls) {
@@ -759,6 +770,7 @@
                 deepSlimChat,
                 parseFailoverUrls,
                 pickNextFailover,
+                computeEverRetryDelay,
             };
         }
         return;
@@ -777,6 +789,8 @@
         failSeq: 0,           // 连续失败计数（自动换路用）
         failoverTried: [],    // 本轮已试过的地址
         lastFailoverAt: 0,    // 上次换路时间戳
+        everRetryTimer: null, // 永续重试定时器
+        everRetryLoopId: 0,   // 循环代次（防并发）
         stats: { detected: 0, recovered: 0, failed: 0, attempts: 0 },
     };
 
@@ -838,6 +852,8 @@
         settings.longOutputMaxTokens = clampInt(settings.longOutputMaxTokens, 1024, 65536, DEFAULTS.longOutputMaxTokens);
         settings.failoverThreshold = clampInt(settings.failoverThreshold, 1, 20, DEFAULTS.failoverThreshold);
         settings.failoverCooldownSec = clampInt(settings.failoverCooldownSec, 60, 3600, DEFAULTS.failoverCooldownSec);
+        settings.everRetryMaxMinutes = clampInt(settings.everRetryMaxMinutes, 5, 240, DEFAULTS.everRetryMaxMinutes);
+        settings.everRetryBaseSec = clampInt(settings.everRetryBaseSec, 15, 600, DEFAULTS.everRetryBaseSec);
         if (typeof settings.failoverUrls !== 'string') settings.failoverUrls = DEFAULTS.failoverUrls;
         if (typeof settings.handleTypes !== 'string') settings.handleTypes = DEFAULTS.handleTypes;
     }
@@ -961,6 +977,7 @@
         } else if (verdict === 'failed') {
             state.stats.failed += 1;
             bumpFailSeq();
+            scheduleEverRetry();
             const errs = state.recentErrors.slice(-3).map((e) => e.text);
             notify(
                 '空回复自动修复失败（已重试）。' +
@@ -1092,6 +1109,59 @@
         } catch (_) {
             return false;
         }
+    }
+
+    // ---------- 永续重试（v2.11.0）----------
+    async function everRetryLoop() {
+        const loopId = ++state.everRetryLoopId;
+        const until = Date.now() + settings.everRetryMaxMinutes * 60000;
+        const factor = 1.8;
+        const baseSec = settings.everRetryBaseSec;
+        const capSec = 300;
+        let attempt = 0;
+        while (loopId === state.everRetryLoopId && Date.now() < until && settings.enabled) {
+            if (state.abandoned || state.busy) break;
+            attempt += 1;
+            const waitSec = computeEverRetryDelay(baseSec, factor, attempt, capSec);
+            debugLog('永续重试: 第 ' + attempt + ' 次等待 ' + waitSec + 's');
+            await sleep(waitSec * 1000);
+            if (loopId !== state.everRetryLoopId || state.abandoned || !settings.enabled) break;
+            // 最后一条已非空（用户手动/它路成功）→ 结束
+            const last = ctx && Array.isArray(ctx.chat) ? ctx.chat[ctx.chat.length - 1] : null;
+            if (last && !last.is_user && !last.is_system && !isEmptyMessage(last.mes, settings)) {
+                break;
+            }
+            if (!last || last.is_user) break; // 没有可重试的消息
+            try {
+                state.selfGenerating = true;
+                await ctx.generate('regenerate', {});
+            } catch (err) {
+                recordError(err);
+                debugLog('永续重试失败:', friendlyError(err));
+                continue;
+            } finally {
+                state.selfGenerating = false;
+            }
+            // 检查结果
+            const after = ctx && Array.isArray(ctx.chat) ? ctx.chat[ctx.chat.length - 1] : null;
+            if (after && !after.is_user && !after.is_system && !isEmptyMessage(after.mes, settings)) {
+                notify('线路已恢复，空回复已自动补上 ✔', 'success', 6000);
+                recordEvent('ever-retry-recovered', { attempt });
+                break;
+            }
+        }
+        if (loopId === state.everRetryLoopId) state.everRetryTimer = null;
+    }
+
+    function scheduleEverRetry() {
+        if (!settings.enabled || !settings.enableEverRetry || state.busy) return;
+        if (state.everRetryTimer) return; // 已有循环在跑
+        const last = ctx && Array.isArray(ctx.chat) ? ctx.chat[ctx.chat.length - 1] : null;
+        if (!last || last.is_user || !isEmptyMessage(last.mes, settings)) return;
+        debugLog('进入永续重试（后台自动补回复）');
+        recordEvent('ever-retry-start', { maxMinutes: settings.everRetryMaxMinutes });
+        state.everRetryTimer = 'running';
+        everRetryLoop().catch((e) => { debugLog('everRetryLoop crashed', e); state.everRetryTimer = null; });
     }
 
     async function performFailover() {
@@ -1296,6 +1366,10 @@
             '  <label class="checkbox_label"><input type="checkbox" id="erg_fail_enable"> 连续失败 N 次自动切换备用 API 地址（静默）</label>',
             '  <div class="erg-row"><span>备用地址列表</span><input type="text" id="erg_fail_urls" placeholder="https://站1/v1, https://站2/v1"></div>',
             '  <div class="erg-row"><span>触发阈值（连续失败次数）</span><input type="number" id="erg_fail_threshold" min="1" max="20" step="1"></div>',
+            '  <h4 class="erg-sub">永续重试（线路恢复自动补回复）</h4>',
+            '  <label class="checkbox_label"><input type="checkbox" id="erg_ever_enable"> 失败后后台自动重试，直到把回复补出来</label>',
+            '  <div class="erg-row"><span>最长持续（分钟）</span><input type="number" id="erg_ever_minutes" min="5" max="240" step="5"></div>',
+            '  <div class="erg-row"><span>首轮间隔（秒）</span><input type="number" id="erg_ever_base" min="15" max="600" step="15"></div>',
             '  <label class="checkbox_label"><input type="checkbox" id="erg_debug"> 调试日志（控制台）</label>',
             '  <div class="erg-stats" id="erg_stats"></div>',
             '  <div class="erg-buttons">',
@@ -1336,6 +1410,9 @@
         $('#erg_fail_enable').prop('checked', !!settings.enableFailover);
         $('#erg_fail_urls').val(settings.failoverUrls);
         $('#erg_fail_threshold').val(settings.failoverThreshold);
+        $('#erg_ever_enable').prop('checked', !!settings.enableEverRetry);
+        $('#erg_ever_minutes').val(settings.everRetryMaxMinutes);
+        $('#erg_ever_base').val(settings.everRetryBaseSec);
         $('#erg_debug').prop('checked', !!settings.debug);
         refreshStatsUi();
     }
@@ -1455,6 +1532,20 @@
         $('#erg_fail_threshold').on('change', function () {
             settings.failoverThreshold = clampInt($(this).val(), 1, 20, DEFAULTS.failoverThreshold);
             $(this).val(settings.failoverThreshold);
+            saveSettings();
+        });
+        $('#erg_ever_enable').on('change', function () {
+            settings.enableEverRetry = $(this).prop('checked');
+            saveSettings();
+        });
+        $('#erg_ever_minutes').on('change', function () {
+            settings.everRetryMaxMinutes = clampInt($(this).val(), 5, 240, DEFAULTS.everRetryMaxMinutes);
+            $(this).val(settings.everRetryMaxMinutes);
+            saveSettings();
+        });
+        $('#erg_ever_base').on('change', function () {
+            settings.everRetryBaseSec = clampInt($(this).val(), 15, 600, DEFAULTS.everRetryBaseSec);
+            $(this).val(settings.everRetryBaseSec);
             saveSettings();
         });
         $('#erg_debug').on('change', function () {
