@@ -1,11 +1,13 @@
 /*!
- * 空回守卫 Empty Reply Guard v2.3.0
+ * 空回守卫 Empty Reply Guard v2.4.0
  * 自动检测并修复酒馆(SillyTavern)的“空回复”（仅供私人使用）。
  * v2.0 新增“请求层修复”：包装 window.fetch，在生成请求到达酒馆解析器之前
  * 就完成 空流自动重试 → 非流式兜底 → 格式修复 → 工具调用提示，
  * 让酒馆“第一次就不空”（纯本地运行，不依赖任何服务器）。
  * v2.2 新增：把“空流类错误”（如 empty_stream: 上游返回空流(无 contentBlock)，
  * 常见于中转站 Claude 渠道）也纳入自动重试/非流式兜底，而不是透传报错。
+ * v2.4 新增：非流式请求也由请求层接管（关掉流式的用户同样有“空内容自动重试”），
+ * 新开空白窗口的随机空回/空流同样被兜住。
  * License: MIT
  */
 (function (global) {
@@ -13,7 +15,7 @@
 
     const PLUGIN_KEY = 'emptyReplyGuard';
     const PLUGIN_NAME = '空回守卫 · Empty Reply Guard';
-    const VERSION = '2.3.0';
+    const VERSION = '2.4.0';
 
     // =========================================================
     // 默认设置（会合并进 extension_settings.emptyReplyGuard）
@@ -444,6 +446,57 @@
             return toolCallsSeen ? 'toolcalls' : 'empty';
         }
 
+        /**
+         * 非流式请求守卫（v2.4.0）：客户端关闭流式时也生效。
+         * 上游返回空内容/空流类错误 → 自动重试；仍空 → 返回可读结果。
+         * @returns {{status:number, json:object}}
+         */
+        async function guardPlain(input, init, bodyJson, opts) {
+            const maxAttempts = 1 + Math.max(0, Number(opts.maxRetries) || 0);
+            let lastJson = null;
+            for (let attempt = 0; attempt < maxAttempts; attempt++) {
+                if (attempt > 0) {
+                    deps.log('非流式空内容，第 ' + attempt + '/' + opts.maxRetries + ' 次自动重试...');
+                    await sleep(opts.delayMs);
+                }
+                const resp = await doFetch(input, init, bodyJson, false);
+                if (!resp.ok) {
+                    const text = await resp.clone().text().catch(() => '');
+                    const errJson = tryJsonParse(text);
+                    if (errJson && errJson.error) return { status: resp.status, json: errJson };
+                    if (resp.status >= 500 && attempt < maxAttempts - 1) {
+                        deps.log('上游 5xx status=' + resp.status + '，自动重试...');
+                        continue;
+                    }
+                    return { status: resp.status, json: { error: { message: '生成请求失败：' + resp.status + ' ' + String(text).slice(0, 200) } } };
+                }
+                const json = await resp.json().catch(() => null);
+                lastJson = json;
+                if (json && json.error) {
+                    const rawMsg = String(json.error.message || '');
+                    if (ergIsEmptyStreamError(rawMsg) && attempt < maxAttempts - 1) {
+                        deps.log('非流式遇到空流类错误，继续重试...');
+                        continue;
+                    }
+                    return { status: resp.status, json };
+                }
+                const text = json ? ergExtractContentText(json) : '';
+                if (text) return { status: 200, json };
+                if (ergHasToolCalls(json)) {
+                    deps.log('上游只返回了工具调用，没有正文');
+                    return { status: 200, json: { error: { message: TOOLCALL_HINT } } };
+                }
+                // 空内容 → 下一轮重试
+            }
+            // 重试用尽：返回最后一次响应（如果存在）
+            if (lastJson) return { status: 200, json: lastJson };
+            return { status: 502, json: { error: { message: '上游连续 ' + maxAttempts + ' 次返回空内容（空回守卫已自动重试）' } } };
+        }
+
+        function tryJsonParse(s) {
+            try { return JSON.parse(s); } catch { return null; }
+        }
+
         return async function guardedFetch(input, init) {
             const opts = deps.getOptions();
             if (!opts || !opts.enabled) return deps.fetchImpl(input, init);
@@ -459,22 +512,31 @@
                 return deps.fetchImpl(input, init);
             }
             deps.log('拦截生成请求（请求层修复）：model=' + (bodyJson.model || '(未指定)') + (Array.isArray(bodyJson.tools) && bodyJson.tools.length ? '（带 tools）' : ''));
-            const enc = new TextEncoder();
-            const out = new ReadableStream({
-                async start(controller) {
-                    try {
-                        await handleStreaming(controller, enc, input, init, bodyJson, opts);
-                    } catch (e) {
-                        enq(controller, enc, 'data: ' + JSON.stringify({ error: { message: '空回守卫请求层错误: ' + ((e && e.message) || e) } }) + '\n\n');
-                    } finally {
-                        enq(controller, enc, 'data: [DONE]\n\n');
-                        try { controller.close(); } catch (_) { /* already closed */ }
-                    }
-                },
-            });
-            return new Response(out, {
-                status: 200,
-                headers: { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-cache, no-store' },
+            if (bodyJson.stream) {
+                // 流式请求：缓冲+空流重试+非流式兜底，输出标准 SSE
+                const enc = new TextEncoder();
+                const out = new ReadableStream({
+                    async start(controller) {
+                        try {
+                            await handleStreaming(controller, enc, input, init, bodyJson, opts);
+                        } catch (e) {
+                            enq(controller, enc, 'data: ' + JSON.stringify({ error: { message: '空回守卫请求层错误: ' + ((e && e.message) || e) } }) + '\n\n');
+                        } finally {
+                            enq(controller, enc, 'data: [DONE]\n\n');
+                            try { controller.close(); } catch (_) { /* already closed */ }
+                        }
+                    },
+                });
+                return new Response(out, {
+                    status: 200,
+                    headers: { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-cache, no-store' },
+                });
+            }
+            // 非流式请求：空内容自动重试，仍按 JSON 返回
+            const result = await guardPlain(input, init, bodyJson, opts);
+            return new Response(JSON.stringify(result.json), {
+                status: result.status,
+                headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
             });
         };
     }
@@ -1119,8 +1181,9 @@
         try {
             const u = new URL(String(urlStr), global.location ? global.location.href : undefined);
             const p = u.pathname;
+            // v2.4.0：流式与非流式生成请求都接管（关流式的用户同样有请求层修复）
             return (p.endsWith('/chat/completions') || p.indexOf('/api/backends/chat-completions/generate') !== -1)
-                && bodyJson && bodyJson.stream === true && Array.isArray(bodyJson.messages);
+                && bodyJson && typeof bodyJson.stream === 'boolean' && Array.isArray(bodyJson.messages);
         } catch (_) { return false; }
     }
 
