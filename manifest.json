@@ -1,6 +1,6 @@
 {
     "display_name": "空回守卫 Empty Reply Guard",
-    "version": "2.9.0",
+    "version": "2.10.0",
     "description": "自动修复 SillyTavern 空回复（有输入没输出/只有…占位）：自动重试→非流式回退→显示接口真实报错→一键复制诊断。适用于 new-api / one-api / 各类 OpenAI 兼容中转站。Auto-fix empty replies from OpenAI-compatible relay APIs.",
     "author": "empty-reply-guard",
     "homepage": "https://github.com/112222612/st",

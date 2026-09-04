@@ -16,9 +16,8 @@
  * 把最长的预设/世界书条目做成要点摘要替换，几千 token 压到几百。
  * v2.8 新增：长输出保护——单轮 max_tokens 设置过大时在发送前钳制到安全值，
  * 避免超长输出把渠道/网关超时全部撞爆（配合酒馆“自动续写”使用更佳）。
- * v2.9 新增：一键协议切换——把聊天补全源从 OpenAI 兼容切成 Claude 原生协议
- * （/v1/messages，绕开 new-api 的 OpenAI 转换层），URL 自动派生，静默执行；
- * 唯一需要手动的是把 API Key 粘到 Claude 密钥栏一次（酒馆安全设计，插件写不了 secret）。
+ * v2.10 新增：自动换路——连续失败（空回/5xx/边缘线路问题）时自动把 API 地址
+ * 切到备用地址（默认 .online <-> .xyz 互换），全程静默，无需任何手动操作。
  * License: MIT
  */
 (function (global) {
@@ -26,7 +25,7 @@
 
     const PLUGIN_KEY = 'emptyReplyGuard';
     const PLUGIN_NAME = '空回守卫 · Empty Reply Guard';
-    const VERSION = '2.9.0';
+    const VERSION = '2.10.0';
 
     // =========================================================
     // 默认设置（会合并进 extension_settings.emptyReplyGuard）
@@ -55,6 +54,10 @@
         slimSummaryMaxItems: 2,        // 每轮最多摘要的条目数
         enableLongOutputGuard: true,   // 长输出保护：单轮 max_tokens 过大时钳制
         longOutputMaxTokens: 8192,     // 单轮输出上限（超过则发送前钳制；配合自动续写）
+        enableFailover: true,          // 自动换路：连续失败自动切换备用 API 地址
+        failoverUrls: 'https://emtf.aipm9527.online/v1, https://emtf.aipm9527.xyz/v1', // 备用地址（逗号分隔，可改成自己的站）
+        failoverThreshold: 3,          // 连续失败 N 次触发换路
+        failoverCooldownSec: 300,      // 同一地址切换冷却（秒）
     };
 
     // =========================================================
@@ -711,22 +714,30 @@
     }
 
     // =========================================================
-    // 一键协议切换（v2.9.0）
+    // 自动换路（v2.10.0）：备用地址解析
     // =========================================================
 
-    /** 从当前 API 地址派生 Claude 原生端点根地址（去掉 /v1 与尾部斜杠）。 */
-    function deriveClaudeBaseUrl(url) {
-        const u = String(url || '').trim();
-        if (!u) return '';
-        try {
-            const parsed = new URL(u);
-            let path = parsed.pathname.replace(/\/+$/, '');
-            if (path.endsWith('/v1')) path = path.slice(0, -3);
-            return parsed.origin + path.replace(/\/+$/, '');
-        } catch (_) {
-            // 非 URL（可能只有域名:端口）→ 去掉尾部 /v1 与斜杠
-            return u.replace(/\/?v1$/, '').replace(/\/+$/, '');
+    /** 解析备用地址列表（逗号/空格/换行分隔），去空、去重、统一加 /v1。 */
+    function parseFailoverUrls(raw) {
+        const out = [];
+        for (const part of String(raw || '').split(/[,，\s\n]+/)) {
+            let u = part.trim().replace(/\/+$/, '');
+            if (!u) continue;
+            if (!/^https?:\/\//i.test(u)) u = 'https://' + u;
+            if (!/\/v1$/i.test(u)) u += '/v1';
+            if (!out.includes(u)) out.push(u);
         }
+        return out;
+    }
+
+    /** 选出下一个要尝试的候选地址（排除当前地址和最近已试过的地址）。 */
+    function pickNextFailover(currentUrl, allUrls, excludeSet) {
+        for (const u of allUrls) {
+            if (u === currentUrl) continue;
+            if (excludeSet && excludeSet.has(u)) continue;
+            return u;
+        }
+        return null;
     }
 
     // =========================================================
@@ -746,7 +757,8 @@
                 planContextTrim,
                 slimChatMessages,
                 deepSlimChat,
-                deriveClaudeBaseUrl,
+                parseFailoverUrls,
+                pickNextFailover,
             };
         }
         return;
@@ -762,6 +774,9 @@
         recentEvents: [],     // 最近事件（诊断用）
         slimHinted: false,    // 请求瘦身首次提示标记
         summaryCache: {},     // 深瘦身摘要缓存（会话级）
+        failSeq: 0,           // 连续失败计数（自动换路用）
+        failoverTried: [],    // 本轮已试过的地址
+        lastFailoverAt: 0,    // 上次换路时间戳
         stats: { detected: 0, recovered: 0, failed: 0, attempts: 0 },
     };
 
@@ -821,6 +836,9 @@
         settings.slimSummaryTargetChars = clampInt(settings.slimSummaryTargetChars, 200, 8000, DEFAULTS.slimSummaryTargetChars);
         settings.slimSummaryMaxItems = clampInt(settings.slimSummaryMaxItems, 1, 5, DEFAULTS.slimSummaryMaxItems);
         settings.longOutputMaxTokens = clampInt(settings.longOutputMaxTokens, 1024, 65536, DEFAULTS.longOutputMaxTokens);
+        settings.failoverThreshold = clampInt(settings.failoverThreshold, 1, 20, DEFAULTS.failoverThreshold);
+        settings.failoverCooldownSec = clampInt(settings.failoverCooldownSec, 60, 3600, DEFAULTS.failoverCooldownSec);
+        if (typeof settings.failoverUrls !== 'string') settings.failoverUrls = DEFAULTS.failoverUrls;
         if (typeof settings.handleTypes !== 'string') settings.handleTypes = DEFAULTS.handleTypes;
     }
 
@@ -942,6 +960,7 @@
             notify('空回复已自动修复 ✔', 'success', 5000);
         } else if (verdict === 'failed') {
             state.stats.failed += 1;
+            bumpFailSeq();
             const errs = state.recentErrors.slice(-3).map((e) => e.text);
             notify(
                 '空回复自动修复失败（已重试）。' +
@@ -1052,25 +1071,73 @@
         setTimeout(() => { runContextGuard(); }, 400);
     }
 
-    // ---------- 一键协议切换（v2.9.0）----------
-    function switchToClaudeProtocol() {
+    // ---------- 自动换路（v2.10.0）----------
+    function currentApiUrl() {
+        if (!ctx || !ctx.chatCompletionSettings) return '';
+        return String(ctx.chatCompletionSettings.custom_url || ctx.chatCompletionSettings.reverse_proxy || '');
+    }
+
+    /** 探测地址连通性（GET /v1/models，无需 key——能收到 HTTP 响应即连通）。 */
+    async function probeUrl(u) {
         try {
-            if (!ctx || !ctx.chatCompletionSettings) return { ok: false, why: '未找到聊天补全设置' };
-            const cc = ctx.chatCompletionSettings;
-            const curUrl = String(cc.custom_url || cc.reverse_proxy || '');
-            const base = deriveClaudeBaseUrl(curUrl);
-            if (!base) return { ok: false, why: '未找到当前 API 地址（先检查 API 连接设置）' };
-            const preSource = cc.chat_completion_source;
-            cc.chat_completion_source = 'claude';
-            if (typeof cc.reverse_proxy === 'string' && cc.reverse_proxy) cc.reverse_proxy = base;
-            if (typeof cc.custom_url === 'string' && cc.custom_url) cc.custom_url = base;
+            const base = String(u).replace(/\/+$/, '');
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), 10000);
+            try {
+                const resp = await fetch(base + '/models', { method: 'GET', signal: controller.signal, cache: 'no-store' });
+                return resp.status >= 200 && resp.status < 600; // 200/401/403 都说明链路通
+            } finally {
+                clearTimeout(timer);
+            }
+        } catch (_) {
+            return false;
+        }
+    }
+
+    async function performFailover() {
+        try {
+            if (!settings.enabled || !settings.enableFailover) return;
+            const cc = ctx && ctx.chatCompletionSettings;
+            if (!cc) return;
+            const now = Date.now();
+            if (now - state.lastFailoverAt < settings.failoverCooldownSec * 1000) return; // 冷却中
+            const cur = currentApiUrl();
+            const all = parseFailoverUrls(settings.failoverUrls);
+            if (all.length < 2) return;
+            const candidate = pickNextFailover(cur, all, new Set(state.failoverTried));
+            if (!candidate) {
+                // 全部试过一轮：重置试过列表，静默回家
+                state.failoverTried = [];
+                return;
+            }
+            // 先探测再切（避免切到同样坏的线路）
+            const ok = await probeUrl(candidate);
+            if (!ok) {
+                state.failoverTried.push(candidate);
+                debugLog('备用地址不可达，跳过:', candidate);
+                return;
+            }
+            // 写入酒馆设置并保存
+            if (typeof cc.custom_url === 'string' && cc.custom_url) cc.custom_url = candidate;
+            else cc.reverse_proxy = candidate;
             if (typeof ctx.saveSettingsDebounced === 'function') ctx.saveSettingsDebounced();
-            recordEvent('protocol-switch', { from: preSource, to: 'claude', base });
-            debugLog('已切换 Claude 原生协议: ' + base);
-            return { ok: true, base };
+            state.failoverTried = [];
+            state.lastFailoverAt = now;
+            state.failSeq = 0;
+            recordEvent('failover', { from: cur, to: candidate });
+            debugLog('已自动切换 API 地址: ' + candidate);
+            notify('已自动切换备用线路（' + candidate.replace(/^https?:\/\//, '') + '），无需任何操作。', 'info', 6000);
         } catch (e) {
-            debugLog('switchToClaudeProtocol failed', e);
-            return { ok: false, why: String(e && e.message || e) };
+            debugLog('performFailover failed', e);
+        }
+    }
+
+    function bumpFailSeq() {
+        if (!settings.enabled || !settings.enableFailover) return;
+        state.failSeq += 1;
+        if (state.failSeq >= settings.failoverThreshold) {
+            state.failSeq = 0;
+            performFailover();
         }
     }
 
@@ -1160,6 +1227,10 @@
         if (!Number.isInteger(idx) || idx < 0 || idx >= ctx.chat.length) return;
         const msg = ctx.chat[idx];
         if (!msg || msg.is_user || msg.is_system) return;
+        // 成功收到一条回复 → 线路健康，失败计数清零
+        if (state.failSeq > 0 && !isEmptyMessage(msg.mes, settings)) {
+            state.failSeq = 0;
+        }
         // 只处理“最后一条消息”为空的情况（regenerate 语义所在）
         if (idx !== ctx.chat.length - 1) return;
         if (!isEmptyMessage(msg.mes, settings)) return;
@@ -1221,6 +1292,10 @@
             '  <h4 class="erg-sub">长输出保护（防单轮拉满被掐断）</h4>',
             '  <label class="checkbox_label"><input type="checkbox" id="erg_long_enable"> 单轮 max_tokens 过大时发送前钳制</label>',
             '  <div class="erg-row"><span>单轮输出上限 tokens</span><input type="number" id="erg_long_max" min="1024" max="65536" step="1024"></div>',
+            '  <h4 class="erg-sub">自动换路（连续失败自动切备用线路）</h4>',
+            '  <label class="checkbox_label"><input type="checkbox" id="erg_fail_enable"> 连续失败 N 次自动切换备用 API 地址（静默）</label>',
+            '  <div class="erg-row"><span>备用地址列表</span><input type="text" id="erg_fail_urls" placeholder="https://站1/v1, https://站2/v1"></div>',
+            '  <div class="erg-row"><span>触发阈值（连续失败次数）</span><input type="number" id="erg_fail_threshold" min="1" max="20" step="1"></div>',
             '  <label class="checkbox_label"><input type="checkbox" id="erg_debug"> 调试日志（控制台）</label>',
             '  <div class="erg-stats" id="erg_stats"></div>',
             '  <div class="erg-buttons">',
@@ -1228,7 +1303,7 @@
             '    <button id="erg_copy_diag">复制诊断信息</button>',
             '    <button id="erg_reset_stats">清零统计</button>',
             '  </div>',
-            '  <div class="erg-row erg-switch-row"><button id="erg_switch_protocol">一键切换 Claude 原生协议（绕开中转站转换层）</button></div>',
+
             '</div>',
         ].join('\n');
     }
@@ -1258,6 +1333,9 @@
         $('#erg_deepslim_items').val(settings.slimSummaryMaxItems);
         $('#erg_long_enable').prop('checked', !!settings.enableLongOutputGuard);
         $('#erg_long_max').val(settings.longOutputMaxTokens);
+        $('#erg_fail_enable').prop('checked', !!settings.enableFailover);
+        $('#erg_fail_urls').val(settings.failoverUrls);
+        $('#erg_fail_threshold').val(settings.failoverThreshold);
         $('#erg_debug').prop('checked', !!settings.debug);
         refreshStatsUi();
     }
@@ -1365,6 +1443,20 @@
             $(this).val(settings.longOutputMaxTokens);
             saveSettings();
         });
+        $('#erg_fail_enable').on('change', function () {
+            settings.enableFailover = $(this).prop('checked');
+            saveSettings();
+        });
+        $('#erg_fail_urls').on('change', function () {
+            settings.failoverUrls = String($(this).val() || '').trim() || DEFAULTS.failoverUrls;
+            $(this).val(settings.failoverUrls);
+            saveSettings();
+        });
+        $('#erg_fail_threshold').on('change', function () {
+            settings.failoverThreshold = clampInt($(this).val(), 1, 20, DEFAULTS.failoverThreshold);
+            $(this).val(settings.failoverThreshold);
+            saveSettings();
+        });
         $('#erg_debug').on('change', function () {
             settings.debug = $(this).prop('checked');
             saveSettings();
@@ -1387,15 +1479,7 @@
             refreshStatsUi();
             notify('统计已清零。', 'info');
         });
-        $('#erg_switch_protocol').on('click', function () {
-            const r = switchToClaudeProtocol();
-            if (r.ok) {
-                // 静默切换；只提示唯一一次必要的操作
-                notify('已切换为 Claude 原生协议（静默）。若 Claude 密钥栏为空，请把 API Key 粘贴一次即可。', 'info', 10000);
-            } else {
-                notify('切换失败：' + (r.why || '未知原因'), 'error');
-            }
-        });
+
     }
 
     // ---------- 诊断 ----------
@@ -1504,7 +1588,11 @@
                     delayMs: 1200,
                     maxOutputTokens: settings.enableLongOutputGuard ? settings.longOutputMaxTokens : 0,
                 }),
-                log: (msg) => { console.log('[空回守卫]', msg); recordEvent('fetch-guard', { msg }); },
+                log: (msg) => {
+                    console.log('[空回守卫]', msg);
+                    recordEvent('fetch-guard', { msg });
+                    if (/失败|错误|5xx|不可用/i.test(msg)) bumpFailSeq();
+                },
                 isTarget: isTargetFetch,
             });
             debugLog('请求层修复已安装（window.fetch 已包装）');
