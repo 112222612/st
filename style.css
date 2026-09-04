@@ -54,6 +54,16 @@
     gap: 6px;
     margin-top: 4px;
 }
+.empty-reply-guard-settings .erg-switch-row {
+    margin-top: 6px;
+}
+.empty-reply-guard-settings .erg-switch-row button {
+    width: 100%;
+    font-size: 12px;
+    padding: 6px 10px;
+    border-radius: 8px;
+    border-color: var(--SmartThemeBlurTintColor, #7fb2a0);
+}
 .empty-reply-guard-settings .erg-buttons button {
     font-size: 12px;
     padding: 4px 10px;

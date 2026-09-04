@@ -16,6 +16,9 @@
  * 把最长的预设/世界书条目做成要点摘要替换，几千 token 压到几百。
  * v2.8 新增：长输出保护——单轮 max_tokens 设置过大时在发送前钳制到安全值，
  * 避免超长输出把渠道/网关超时全部撞爆（配合酒馆“自动续写”使用更佳）。
+ * v2.9 新增：一键协议切换——把聊天补全源从 OpenAI 兼容切成 Claude 原生协议
+ * （/v1/messages，绕开 new-api 的 OpenAI 转换层），URL 自动派生，静默执行；
+ * 唯一需要手动的是把 API Key 粘到 Claude 密钥栏一次（酒馆安全设计，插件写不了 secret）。
  * License: MIT
  */
 (function (global) {
@@ -23,7 +26,7 @@
 
     const PLUGIN_KEY = 'emptyReplyGuard';
     const PLUGIN_NAME = '空回守卫 · Empty Reply Guard';
-    const VERSION = '2.8.0';
+    const VERSION = '2.9.0';
 
     // =========================================================
     // 默认设置（会合并进 extension_settings.emptyReplyGuard）
@@ -708,6 +711,25 @@
     }
 
     // =========================================================
+    // 一键协议切换（v2.9.0）
+    // =========================================================
+
+    /** 从当前 API 地址派生 Claude 原生端点根地址（去掉 /v1 与尾部斜杠）。 */
+    function deriveClaudeBaseUrl(url) {
+        const u = String(url || '').trim();
+        if (!u) return '';
+        try {
+            const parsed = new URL(u);
+            let path = parsed.pathname.replace(/\/+$/, '');
+            if (path.endsWith('/v1')) path = path.slice(0, -3);
+            return parsed.origin + path.replace(/\/+$/, '');
+        } catch (_) {
+            // 非 URL（可能只有域名:端口）→ 去掉尾部 /v1 与斜杠
+            return u.replace(/\/?v1$/, '').replace(/\/+$/, '');
+        }
+    }
+
+    // =========================================================
     // 浏览器/酒馆环境
     // =========================================================
     if (typeof global.document === 'undefined' || !global.document.documentElement) {
@@ -724,6 +746,7 @@
                 planContextTrim,
                 slimChatMessages,
                 deepSlimChat,
+                deriveClaudeBaseUrl,
             };
         }
         return;
@@ -1029,6 +1052,28 @@
         setTimeout(() => { runContextGuard(); }, 400);
     }
 
+    // ---------- 一键协议切换（v2.9.0）----------
+    function switchToClaudeProtocol() {
+        try {
+            if (!ctx || !ctx.chatCompletionSettings) return { ok: false, why: '未找到聊天补全设置' };
+            const cc = ctx.chatCompletionSettings;
+            const curUrl = String(cc.custom_url || cc.reverse_proxy || '');
+            const base = deriveClaudeBaseUrl(curUrl);
+            if (!base) return { ok: false, why: '未找到当前 API 地址（先检查 API 连接设置）' };
+            const preSource = cc.chat_completion_source;
+            cc.chat_completion_source = 'claude';
+            if (typeof cc.reverse_proxy === 'string' && cc.reverse_proxy) cc.reverse_proxy = base;
+            if (typeof cc.custom_url === 'string' && cc.custom_url) cc.custom_url = base;
+            if (typeof ctx.saveSettingsDebounced === 'function') ctx.saveSettingsDebounced();
+            recordEvent('protocol-switch', { from: preSource, to: 'claude', base });
+            debugLog('已切换 Claude 原生协议: ' + base);
+            return { ok: true, base };
+        } catch (e) {
+            debugLog('switchToClaudeProtocol failed', e);
+            return { ok: false, why: String(e && e.message || e) };
+        }
+    }
+
     // ---------- 请求自动瘦身（v2.6.0 / 深瘦身 v2.7.0）----------
     async function summarizeText(text) {
         try {
@@ -1183,6 +1228,7 @@
             '    <button id="erg_copy_diag">复制诊断信息</button>',
             '    <button id="erg_reset_stats">清零统计</button>',
             '  </div>',
+            '  <div class="erg-row erg-switch-row"><button id="erg_switch_protocol">一键切换 Claude 原生协议（绕开中转站转换层）</button></div>',
             '</div>',
         ].join('\n');
     }
@@ -1340,6 +1386,15 @@
             state.recentEvents = [];
             refreshStatsUi();
             notify('统计已清零。', 'info');
+        });
+        $('#erg_switch_protocol').on('click', function () {
+            const r = switchToClaudeProtocol();
+            if (r.ok) {
+                // 静默切换；只提示唯一一次必要的操作
+                notify('已切换为 Claude 原生协议（静默）。若 Claude 密钥栏为空，请把 API Key 粘贴一次即可。', 'info', 10000);
+            } else {
+                notify('切换失败：' + (r.why || '未知原因'), 'error');
+            }
         });
     }
 
