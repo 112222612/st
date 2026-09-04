@@ -12,6 +12,8 @@
  * v2.6 新增：请求自动瘦身——监听酒馆 chat_completion_prompt_ready 事件，
  * 在发送前对完整请求体（含预设/世界书/角色卡/系统提示）自动精简：
  * 超长内容截断 + 总预算超限裁剪最旧消息。不修改任何存档。
+ * v2.7 新增：深瘦身——截断后仍超预算时，用当前模型（走酒馆自己的 key）
+ * 把最长的预设/世界书条目做成要点摘要替换，几千 token 压到几百。
  * License: MIT
  */
 (function (global) {
@@ -19,7 +21,7 @@
 
     const PLUGIN_KEY = 'emptyReplyGuard';
     const PLUGIN_NAME = '空回守卫 · Empty Reply Guard';
-    const VERSION = '2.6.0';
+    const VERSION = '2.7.0';
 
     // =========================================================
     // 默认设置（会合并进 extension_settings.emptyReplyGuard）
@@ -43,6 +45,9 @@
         enableSlimPrompt: true,        // 请求自动瘦身：发送前精简超长预设/世界书内容
         slimThreshold: 0.70,           // 请求总预算达到该比例时触发瘦身（0.5-0.95）
         slimMaxContentChars: 4000,     // 单条内容超过该字符数则截断
+        enableDeepSlim: true,          // 深瘦身：截断后仍超预算 → 用模型把最长条目压缩成摘要
+        slimSummaryTargetChars: 1200,  // 摘要目标字符数
+        slimSummaryMaxItems: 2,        // 每轮最多摘要的条目数
     };
 
     // =========================================================
@@ -652,6 +657,45 @@
         return { chat: arr, clipped, trimmed, totalTokens: total };
     }
 
+    /**
+     * 深瘦身（v2.7.0）：对最长条目做语义摘要替换。
+     * @param {array} chat 消息数组
+     * @param {object} opts { targetTokens, maxItems, minLen, estimateTokens}
+     * @param {(text:string)=>Promise<string|null>} summarize 摘要函数（测试注入 mock）
+     * @returns {Promise<{chat:array, summarized:number}>}
+     */
+    async function deepSlimChat(chat, opts, summarize) {
+        const arr = Array.isArray(chat) ? chat : [];
+        const { targetTokens, maxItems, minLen, estimateTokens } = opts;
+        let summarized = 0;
+        const budget = () => arr.reduce((a, m) => a + Math.max(0, estimateTokens(String(m.content ?? m.mes ?? ''))), 0);
+        let current = budget();
+        const candidates = arr
+            .map((m, i) => ({ i, len: String(m.content ?? m.mes ?? '').length }))
+            .filter((c) => {
+                const m = arr[c.i];
+                // 用户本次输入保留；system/assistant（世界书、预设、旧对话）都可被摘要
+                return !(m && (m.is_user || m.role === 'user')) && c.len >= minLen;
+            })
+            .sort((a, b) => b.len - a.len)
+            .slice(0, Math.max(1, Number(maxItems) || 2));
+        for (const c of candidates) {
+            if (current <= targetTokens) break;
+            const m = arr[c.i];
+            const raw = String(m.content ?? m.mes ?? '');
+            let summary = null;
+            try { summary = await summarize(raw); } catch (_) { summary = null; }
+            if (summary && summary.trim().length >= 15) {
+                const slim = '［压缩摘要］' + summary.trim();
+                m.content = slim;
+                if (m.mes !== undefined) m.mes = slim;
+                summarized++;
+                current = budget();
+            }
+        }
+        return { chat: arr, summarized };
+    }
+
     // =========================================================
     // 浏览器/酒馆环境
     // =========================================================
@@ -668,6 +712,7 @@
                 createFetchGuard,
                 planContextTrim,
                 slimChatMessages,
+                deepSlimChat,
             };
         }
         return;
@@ -682,6 +727,7 @@
         recentErrors: [],     // 最近错误（诊断用）
         recentEvents: [],     // 最近事件（诊断用）
         slimHinted: false,    // 请求瘦身首次提示标记
+        summaryCache: {},     // 深瘦身摘要缓存（会话级）
         stats: { detected: 0, recovered: 0, failed: 0, attempts: 0 },
     };
 
@@ -738,6 +784,8 @@
         settings.contextMinKeep = clampInt(settings.contextMinKeep, 2, 50, DEFAULTS.contextMinKeep);
         settings.slimThreshold = clampFloat(settings.slimThreshold, 0.5, 0.95, DEFAULTS.slimThreshold);
         settings.slimMaxContentChars = clampInt(settings.slimMaxContentChars, 500, 20000, DEFAULTS.slimMaxContentChars);
+        settings.slimSummaryTargetChars = clampInt(settings.slimSummaryTargetChars, 200, 8000, DEFAULTS.slimSummaryTargetChars);
+        settings.slimSummaryMaxItems = clampInt(settings.slimSummaryMaxItems, 1, 5, DEFAULTS.slimSummaryMaxItems);
         if (typeof settings.handleTypes !== 'string') settings.handleTypes = DEFAULTS.handleTypes;
     }
 
@@ -969,7 +1017,25 @@
         setTimeout(() => { runContextGuard(); }, 400);
     }
 
-    // ---------- 请求自动瘦身（v2.6.0）----------
+    // ---------- 请求自动瘦身（v2.6.0 / 深瘦身 v2.7.0）----------
+    async function summarizeText(text) {
+        try {
+            if (!ctx || typeof ctx.sendGenerationRequest !== 'function') return null;
+            const targetChars = settings.slimSummaryTargetChars;
+            const prompt = [
+                { role: 'system', content: '你是内容压缩助手。把用户提供的内容压缩成要点摘要，保留关键设定、人名、地点、数字和重要细节，不要客套话，输出纯文本。' },
+                { role: 'user', content: '请把以下内容压缩为不超过约 ' + targetChars + ' 个字符的要点摘要：\n\n' + String(text).slice(0, 24000) },
+            ];
+            // type='quiet'：走酒馆当前配置的模型与 key，且强制非流式；不写入聊天
+            const data = await ctx.sendGenerationRequest('quiet', { prompt }, {});
+            const out = data?.choices?.[0]?.message?.content;
+            if (typeof out === 'string' && out.trim().length >= 15) return out.trim();
+        } catch (e) {
+            debugLog('深瘦身摘要请求失败:', e);
+        }
+        return null;
+    }
+
     async function handlePromptReady(data) {
         if (!settings.enabled || !settings.enableSlimPrompt || !data || !Array.isArray(data.chat) || data.dryRun) return;
         const maxTokens = Number(ctx.maxContext || 0);
@@ -985,15 +1051,35 @@
                 maxContentChars: settings.slimMaxContentChars,
                 estimateTokens: estByChars,
             });
+            // 深瘦身：截断/裁剪后仍超预算 → 对最长条目做语义摘要
+            let summarized = 0;
+            const targetForDeep = Math.max(1, Math.round(maxTokens * settings.slimThreshold * 0.95));
+            if (settings.enableDeepSlim) {
+                const cache = state.summaryCache;
+                const deepResult = await deepSlimChat(result.chat, {
+                    targetTokens: targetForDeep,
+                    maxItems: settings.slimSummaryMaxItems,
+                    minLen: 2000,
+                    estimateTokens: estByChars,
+                }, async (raw) => {
+                    const key = raw.slice(0, 80) + ':' + raw.length;
+                    if (cache[key] !== undefined) return cache[key];
+                    const s = await summarizeText(raw);
+                    cache[key] = s || null;
+                    return s;
+                });
+                result.chat = deepResult.chat;
+                summarized = deepResult.summarized;
+            }
             // 写回原数组（事件负载可能被酒馆继续引用）
             data.chat.length = 0;
             for (const m of result.chat) data.chat.push(m);
-            if (result.clipped || result.trimmed) {
-                recordEvent('slim-prompt', { clipped: result.clipped, trimmed: result.trimmed, total: result.totalTokens });
-                debugLog('请求瘦身: 截断 ' + result.clipped + ' 条 / 删除 ' + result.trimmed + ' 条');
+            if (result.clipped || result.trimmed || summarized) {
+                recordEvent('slim-prompt', { clipped: result.clipped, trimmed: result.trimmed, summarized, total: result.totalTokens });
+                debugLog('请求瘦身: 截断 ' + result.clipped + ' 条 / 删除 ' + result.trimmed + ' 条 / 摘要 ' + summarized + ' 条');
                 if (!state.slimHinted) {
                     state.slimHinted = true;
-                    notify('请求自动瘦身已生效：超长预设/世界书内容会在发送前自动精简（不修改存档）。', 'info', 8000);
+                    notify('请求自动瘦身已生效：超长预设/世界书内容会在发送前自动精简或压缩成摘要（不修改存档）。', 'info', 8000);
                 }
             }
         } catch (e) {
@@ -1072,6 +1158,9 @@
             '  <label class="checkbox_label"><input type="checkbox" id="erg_slim_enable"> 发送前自动精简超长预设/世界书内容（不修改存档）</label>',
             '  <div class="erg-row"><span>总预算阈值（占 max_context）</span><input type="number" id="erg_slim_threshold" min="0.5" max="0.95" step="0.05"></div>',
             '  <div class="erg-row"><span>单条内容最大字符数</span><input type="number" id="erg_slim_chars" min="500" max="20000" step="500"></div>',
+            '  <label class="checkbox_label"><input type="checkbox" id="erg_deepslim_enable"> 深瘦身：仍超预算时用模型压缩成摘要（用你自己的 key）</label>',
+            '  <div class="erg-row"><span>摘要目标字符数</span><input type="number" id="erg_deepslim_chars" min="200" max="8000" step="100"></div>',
+            '  <div class="erg-row"><span>每轮最多摘要条数</span><input type="number" id="erg_deepslim_items" min="1" max="5" step="1"></div>',
             '  <label class="checkbox_label"><input type="checkbox" id="erg_debug"> 调试日志（控制台）</label>',
             '  <div class="erg-stats" id="erg_stats"></div>',
             '  <div class="erg-buttons">',
@@ -1103,6 +1192,9 @@
         $('#erg_slim_enable').prop('checked', !!settings.enableSlimPrompt);
         $('#erg_slim_threshold').val(settings.slimThreshold);
         $('#erg_slim_chars').val(settings.slimMaxContentChars);
+        $('#erg_deepslim_enable').prop('checked', !!settings.enableDeepSlim);
+        $('#erg_deepslim_chars').val(settings.slimSummaryTargetChars);
+        $('#erg_deepslim_items').val(settings.slimSummaryMaxItems);
         $('#erg_debug').prop('checked', !!settings.debug);
         refreshStatsUi();
     }
@@ -1185,6 +1277,20 @@
         $('#erg_slim_chars').on('change', function () {
             settings.slimMaxContentChars = clampInt($(this).val(), 500, 20000, DEFAULTS.slimMaxContentChars);
             $(this).val(settings.slimMaxContentChars);
+            saveSettings();
+        });
+        $('#erg_deepslim_enable').on('change', function () {
+            settings.enableDeepSlim = $(this).prop('checked');
+            saveSettings();
+        });
+        $('#erg_deepslim_chars').on('change', function () {
+            settings.slimSummaryTargetChars = clampInt($(this).val(), 200, 8000, DEFAULTS.slimSummaryTargetChars);
+            $(this).val(settings.slimSummaryTargetChars);
+            saveSettings();
+        });
+        $('#erg_deepslim_items').on('change', function () {
+            settings.slimSummaryMaxItems = clampInt($(this).val(), 1, 5, DEFAULTS.slimSummaryMaxItems);
+            $(this).val(settings.slimSummaryMaxItems);
             saveSettings();
         });
         $('#erg_debug').on('change', function () {
